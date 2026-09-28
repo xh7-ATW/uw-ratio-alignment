@@ -12,7 +12,7 @@
   "default_run_dir": "outputs/random5_uw_floor_c035",
   "log_stem": "seed{seed}_uw_floor_c035",
   "training": {
-    "script": "pipeline/train/train_alignment.py",
+    "script": "scripts/train/train_alignment.py",
     "torchrun": "torchrun",
     "nproc_per_node": 1
   },

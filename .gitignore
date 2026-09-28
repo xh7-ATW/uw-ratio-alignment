@@ -6,4 +6,4 @@ __pycache__/
 *.tmp
 *.bak
 outputs/
-/runs/weight_dynamics/**/*.jsonl
+/experiment_results/weight_dynamics/**/*.jsonl

@@ -5,7 +5,7 @@
   "seeds": [161317530, 1490436515, 1391286422, 1892922382, 681062724],
   "default_run_dir": "outputs/random5_shared_lr/typed_muonl",
   "log_stem": "seed{seed}_typed_muonl_shared_lr",
-  "training": {"script": "pipeline/train/train_alignment.py", "torchrun": "torchrun", "nproc_per_node": 1},
+  "training": {"script": "scripts/train/train_alignment.py", "torchrun": "torchrun", "nproc_per_node": 1},
   "environment": {
     "MYOPT_SCHEME": "typed_muonl", "MYOPT_SAVE_LOG": "1", "MYOPT_SAVE_DIAG": "0",
     "MYOPT_SAVE_VAL_LOSS_JSONL": "1", "MYOPT_LR": "0.035", "MYOPT_WD": "0.025",

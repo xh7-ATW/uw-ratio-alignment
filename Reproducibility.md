@@ -11,20 +11,20 @@ experiment config -> resolved run config -> raw output -> figure script -> figur
 ## Layout
 
 - `configs/`: canonical experiment definitions used for paper claims.
-- `experiment_lib/`: importable utilities plus data/model/optimizer and
+- `src/`: importable utilities plus data/model/optimizer and
   diagnostic components used by training.
-- `pipeline/run_paper_experiment.py`: config-driven runner; prints commands by
+- `scripts/run_paper_experiment.py`: config-driven runner; prints commands by
   default and executes only with `--execute`.
-- `pipeline/reproduce/`: one-command reproduction scripts for major experiments.
-- `pipeline/train/train_alignment.py`: public training entry point used by the
+- `scripts/reproduce/`: one-command reproduction scripts for major experiments.
+- `scripts/train/train_alignment.py`: public training entry point used by the
   paper configs; it delegates to the modular implementation.
-- `pipeline/analysis/`: diagnostic post-processing scripts.
-- `pipeline/plot_figures/`: canonical scripts for paper figures.
-- `runs/`: paper-named run directories for checking raw outputs.
-- `reference_results/`: externally obtained benchmark outputs used only as
+- `scripts/analysis/`: diagnostic post-processing scripts.
+- `scripts/plot_figures/`: canonical scripts for paper figures.
+- `experiment_results/`: paper-named run directories for checking raw outputs.
+- `external_results/`: externally obtained benchmark outputs used only as
   comparison baselines; these are not runs produced by this artifact's
   training code.
-- `runs/benchmark/`: our 15-trial MuonL benchmark run,
+- `experiment_results/benchmark/`: our 15-trial MuonL benchmark run,
   including its exact standalone training script and raw logs.
 - `figures/`: generated paper figures.
 
@@ -87,14 +87,14 @@ training:
 
 ```bash
 cd iclr_code
-python3 pipeline/run_paper_experiment.py \
+python3 scripts/run_paper_experiment.py \
   --config configs/seed42_uw_floor_u_over_w.json
 ```
 
 To run it:
 
 ```bash
-python3 pipeline/run_paper_experiment.py \
+python3 scripts/run_paper_experiment.py \
   --config configs/seed42_uw_floor_u_over_w.json \
   --execute
 ```
@@ -109,16 +109,16 @@ The following commands regenerate figures from the records included in this
 artifact; they do not start new training:
 
 ```bash
-python3 pipeline/plot_figures/shared_lr_seed42_loss.py
-python3 pipeline/plot_figures/shared_lr_random5_loss.py
+python3 scripts/plot_figures/shared_lr_seed42_loss.py
+python3 scripts/plot_figures/shared_lr_random5_loss.py
 # Summarize our 15-trial MuonL benchmark run against the target loss.
-python3 pipeline/analysis/benchmark_significance.py
-python3 pipeline/plot_figures/benchmark_u_w_performance.py
-python3 pipeline/plot_figures/weight_dynamics.py
+python3 scripts/analysis/benchmark_significance.py
+python3 scripts/plot_figures/benchmark_u_w_performance.py
+python3 scripts/plot_figures/weight_dynamics.py
 ```
 
-These commands intentionally read bundled records: our results from `runs/`,
-and Figure 1(a)'s external comparison data from `reference_results/`.
+These commands intentionally read bundled records: our results from `experiment_results/`,
+and Figure 1(a)'s external comparison data from `external_results/`.
 
 ## Retrain and Then Plot
 
@@ -128,22 +128,22 @@ to their plotting commands:
 ```bash
 # Seed-42 benchmark #9 NorMuon-lite reproduction with u-w floor c=0.35,
 # recording every matrix block every 5 steps, then regenerating Figure 1(b).
-bash pipeline/reproduce/u_over_w.sh
+bash scripts/reproduce/u_over_w.sh
 
 # Seed-42 type-specific Muon diagnostics and t-MuonL loss; then plot the new outputs.
-bash pipeline/reproduce/type_lr_seed42.sh
+bash scripts/reproduce/type_lr_seed42.sh
 
 # Five paired u/w-floor seeds; then plot them against bundled paired baselines.
-bash pipeline/reproduce/uw_floor_random5.sh
+bash scripts/reproduce/uw_floor_random5.sh
 
 # Five paired shared-LR seeds for Muon, t-MuonL, and MuonL; then plot new outputs.
-bash pipeline/reproduce/shared_lr_random5.sh
+bash scripts/reproduce/shared_lr_random5.sh
 
 # Five paired type-specific-LR seeds for Muon and t-MuonL; then plot new outputs.
-bash pipeline/reproduce/type_lr_random5.sh
+bash scripts/reproduce/type_lr_random5.sh
 
 # Figure 8 MuonL, decoupled-OrScale, and OrScale; then plot new weight norms.
-bash pipeline/reproduce/weight_dynamics.sh
+bash scripts/reproduce/weight_dynamics.sh
 ```
 
 ## Paper Evidence

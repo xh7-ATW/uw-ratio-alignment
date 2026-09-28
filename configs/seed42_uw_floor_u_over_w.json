@@ -9,10 +9,10 @@
     "u_w_floor": "fixed lower bound c=0.35 on pre-learning-rate ||U||_F / ||W||_F"
   },
   "seed": 42,
-  "default_run_dir": "runs/uw_floor/seed42_c035_u_over_w/normuon_c035_u_over_w",
+  "default_run_dir": "experiment_results/uw_floor/seed42_c035_u_over_w/normuon_c035_u_over_w",
   "log_stem": "seed42_normuon_benchmark9_uwfloor_c0p35",
   "training": {
-    "script": "pipeline/train/train_alignment.py",
+    "script": "scripts/train/train_alignment.py",
     "torchrun": "torchrun",
     "nproc_per_node": 1
   },

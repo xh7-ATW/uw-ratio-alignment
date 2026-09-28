@@ -9,4 +9,4 @@ description = "Reproducible u-w ratio alignment experiments for MuonL and t-Muon
 requires-python = ">=3.10"
 
 [tool.setuptools.packages.find]
-include = ["experiment_lib*"]
+include = ["src*"]

@@ -12,7 +12,7 @@
   "default_run_dir": "outputs/seed42_type_lr_muon_diag",
   "log_stem": "seed42_type_lr_muon_diag",
   "training": {
-    "script": "pipeline/train/train_alignment.py",
+    "script": "scripts/train/train_alignment.py",
     "torchrun": "torchrun",
     "nproc_per_node": 1
   },

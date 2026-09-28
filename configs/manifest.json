@@ -5,10 +5,10 @@
       "name": "shared_lr_main_loss_comparison",
       "description": "Seed-42 validation-loss comparison among Muon, t-MuonL, and MuonL under the shared learning-rate regime, matching the diagnostic trajectory.",
       "raw_runs": [
-        "runs/shared_lr/seed42_main"
+        "experiment_results/shared_lr/seed42_main"
       ],
       "analysis_scripts": [
-        "pipeline/plot_figures/shared_lr_seed42_loss.py"
+        "scripts/plot_figures/shared_lr_seed42_loss.py"
       ],
       "figures": [
         "figures/shared_lr_seed42_loss.png"
@@ -23,10 +23,10 @@
         "configs/random5_shared_lr_muonl.json"
       ],
       "raw_runs": [
-        "runs/shared_lr/random5_main"
+        "experiment_results/shared_lr/random5_main"
       ],
       "analysis_scripts": [
-        "pipeline/plot_figures/shared_lr_random5_loss.py"
+        "scripts/plot_figures/shared_lr_random5_loss.py"
       ],
       "figures": [
         "figures/shared_lr_random5_loss.png"
@@ -42,14 +42,14 @@
         "configs/random5_type_lr_tmuonl.json"
       ],
       "raw_runs": [
-        "runs/type_lr/seed42_diag",
-        "runs/type_lr/random5_muon_vs_tmuonl"
+        "experiment_results/type_lr/seed42_diag",
+        "experiment_results/type_lr/random5_muon_vs_tmuonl"
       ],
       "analysis_scripts": [
-        "pipeline/analysis/type_lr_diagnostics.py",
-        "pipeline/plot_figures/type_lr_seed42.py",
-        "pipeline/plot_figures/type_lr_assumptions.py",
-        "pipeline/plot_figures/type_lr_loss.py"
+        "scripts/analysis/type_lr_diagnostics.py",
+        "scripts/plot_figures/type_lr_seed42.py",
+        "scripts/plot_figures/type_lr_assumptions.py",
+        "scripts/plot_figures/type_lr_loss.py"
       ],
       "figures": [
         "figures/type_lr_seed42_loss.png",
@@ -68,12 +68,12 @@
         "configs/random5_uw_floor_c035.json"
       ],
       "raw_runs": [
-        "runs/uw_floor/random5_c035",
-        "runs/uw_floor/seed42_c035_u_over_w"
+        "experiment_results/uw_floor/random5_c035",
+        "experiment_results/uw_floor/seed42_c035_u_over_w"
       ],
       "analysis_scripts": [
-        "pipeline/plot_figures/uw_floor_loss.py",
-        "pipeline/plot_figures/uw_floor_u_over_w.py"
+        "scripts/plot_figures/uw_floor_loss.py",
+        "scripts/plot_figures/uw_floor_u_over_w.py"
       ],
       "figures": [
         "figures/uw_floor_loss.png",
@@ -84,22 +84,22 @@
       "name": "benchmark_significance",
       "description": "Our 15-trial shared-learning-rate MuonL benchmark run evaluated against the 3.28 target loss.",
       "raw_runs": [
-        "runs/benchmark"
+        "experiment_results/benchmark"
       ],
       "analysis_scripts": [
-        "pipeline/analysis/benchmark_significance.py"
+        "scripts/analysis/benchmark_significance.py"
       ]
     },
     {
       "name": "benchmark_u_w_performance",
       "description": "External benchmark tail validation-loss comparison for u-w floor versus weight-decay controls.",
       "raw_runs": [
-        "reference_results/benchmark_9_normuon_u_w_floor",
-        "reference_results/benchmark_10_normuon_weight_decay",
-        "reference_results/benchmark_30_projection_pruning"
+        "external_results/benchmark_9_normuon_u_w_floor",
+        "external_results/benchmark_10_normuon_weight_decay",
+        "external_results/benchmark_30_projection_pruning"
       ],
       "analysis_scripts": [
-        "pipeline/plot_figures/benchmark_u_w_performance.py"
+        "scripts/plot_figures/benchmark_u_w_performance.py"
       ],
       "figures": [
         "figures/benchmark_u_w_performance.png"
@@ -109,12 +109,12 @@
       "name": "shape_scaling_and_score_diagnostics",
       "description": "Diagnostic figures for shape-scaling violations, score ratios, and shared-learning-rate MuonL criterion decompositions.",
       "raw_runs": [
-        "runs/shared_lr/seed42_diagnostics",
-        "runs/type_lr/seed42_diag"
+        "experiment_results/shared_lr/seed42_diagnostics",
+        "experiment_results/type_lr/seed42_diag"
       ],
       "analysis_scripts": [
-        "pipeline/plot_figures/shape_scaling.py",
-        "pipeline/plot_figures/criteria.py"
+        "scripts/plot_figures/shape_scaling.py",
+        "scripts/plot_figures/criteria.py"
       ],
       "figures": [
         "figures/shared_lr_score_ratios.png",
@@ -132,12 +132,12 @@
         "configs/seed42_weight_dynamics_orscale.json"
       ],
       "raw_runs": [
-        "runs/weight_dynamics/muonl",
-        "runs/weight_dynamics/decoupled_orscale",
-        "runs/weight_dynamics/orscale"
+        "experiment_results/weight_dynamics/muonl",
+        "experiment_results/weight_dynamics/decoupled_orscale",
+        "experiment_results/weight_dynamics/orscale"
       ],
       "analysis_scripts": [
-        "pipeline/plot_figures/weight_dynamics.py"
+        "scripts/plot_figures/weight_dynamics.py"
       ],
       "figures": [
         "figures/weight_dynamics.png"
