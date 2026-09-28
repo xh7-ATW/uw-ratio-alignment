@@ -1,0 +1,6 @@
+launch_time_utc=2026-07-27T23:14:08Z
+run_root=records/track_3_optimization/results/muonl_draft/runs/random5_h100_mainpdf_loss_only_20260727T145437Z
+seed=1391286422
+scheme=typed_muonl
+CUDA_VISIBLE_DEVICES=0
+command=torchrun --standalone --nproc_per_node=1 records/track_3_optimization/results/muonl_draft/scripts/train/train_alignment.py

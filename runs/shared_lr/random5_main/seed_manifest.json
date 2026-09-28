@@ -1,0 +1,36 @@
+{
+  "purpose": "MuonL mainpdf loss-only random-5-seed paired comparison",
+  "seed_selection": {
+    "method": "python secrets.randbelow using OS entropy",
+    "excluded_seeds": [
+      42
+    ],
+    "generated_at_utc": "2026-07-27T14:54:37+00:00",
+    "python": "3.12.11"
+  },
+  "paired_design": {
+    "seeds": [
+      161317530,
+      1490436515,
+      1391286422,
+      1892922382,
+      681062724
+    ],
+    "schemes": [
+      "plain_muon",
+      "typed_muonl",
+      "alllayer_muonl"
+    ]
+  },
+  "hyperparameters": {
+    "seed42_reference": "separate rerun",
+    "matrix_lr": 0.035,
+    "matrix_weight_decay": 0.025,
+    "cooldown_frac": 0.7,
+    "train_steps": 3300,
+    "schedule_steps": 3300,
+    "val_tokens": 10485760,
+    "diagnostics": "loss-only, MYOPT_SAVE_DIAG=0",
+    "gpu_binding": "CUDA_VISIBLE_DEVICES=0"
+  }
+}

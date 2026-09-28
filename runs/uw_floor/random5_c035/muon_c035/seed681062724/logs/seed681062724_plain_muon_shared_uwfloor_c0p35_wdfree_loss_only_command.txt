@@ -1,0 +1,12 @@
+launch_time_utc=2026-09-09T09:17:23Z
+seed=681062724
+job_name=plain_muon_shared_uwfloor_c0p35_wdfree
+scheme=plain_muon
+matrix_lr=0.035
+matrix_wd=0
+uw_floor_mode=fixed
+uw_floor_c=0.35
+save_uw_floor_summary=0
+uw_floor_summary_freq=1
+raw_log=../../../../records/track_3_optimization/results/iclr_code/runs/random5_shared_uwfloor_c0p35_wdfree_20260909T042915Z/plain_muon_shared_uwfloor_c0p35_wdfree/seed681062724/raw/seed681062724_plain_muon_shared_uwfloor_c0p35_wdfree_loss_only.txt
+command=torchrun --standalone --nproc_per_node=1 ../../../../records/track_3_optimization/results/iclr_code/scripts/train/train_alignment.py 

@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "experiment_name": "seed42_uw_floor_u_over_w",
+  "description": "Seed-42 reproduction of benchmark #9 NorMuon-lite with a fixed pre-learning-rate u-w floor c=0.35, recording every matrix block every 5 optimizer steps for Figure 1b.",
+  "paper_terms": {
+    "method": "NorMuon-lite + u-w floor (benchmark #9 reproduction)",
+    "learning_rate_regime": "benchmark #9 shared learning rate",
+    "matrix_weight_decay": "none",
+    "u_w_floor": "fixed lower bound c=0.35 on pre-learning-rate ||U||_F / ||W||_F"
+  },
+  "seed": 42,
+  "default_run_dir": "runs/uw_floor/seed42_c035_u_over_w/normuon_c035_u_over_w",
+  "log_stem": "seed42_normuon_benchmark9_uwfloor_c0p35",
+  "training": {
+    "script": "pipeline/train/train_alignment.py",
+    "torchrun": "torchrun",
+    "nproc_per_node": 1
+  },
+  "environment": {
+    "MYOPT_SCHEME": "normuon",
+    "MYOPT_INIT_MODE": "benchmark_default",
+    "MYOPT_NORMUON_BETA2": "0.95",
+    "MYOPT_SAVE_LOG": "1",
+    "MYOPT_SAVE_DIAG": "0",
+    "MYOPT_SAVE_U_OVER_W_JSON": "1",
+    "MYOPT_U_OVER_W_FREQ": "5",
+    "MYOPT_SAVE_VAL_LOSS_JSONL": "1",
+    "MYOPT_LR": "0.0375",
+    "MYOPT_WD": "0",
+    "MYOPT_QKV_LR": "0.0375",
+    "MYOPT_ATTN_PROJ_LR": "0.0375",
+    "MYOPT_MLP_FC_LR": "0.0375",
+    "MYOPT_MLP_PROJ_LR": "0.0375",
+    "MYOPT_QKV_WD": "0",
+    "MYOPT_ATTN_PROJ_WD": "0",
+    "MYOPT_MLP_FC_WD": "0",
+    "MYOPT_MLP_PROJ_WD": "0",
+    "MYOPT_NS_STEPS": "12",
+    "MYOPT_NESTEROV": "1",
+    "MYOPT_COOLDOWN_FRAC": "0.7",
+    "MYOPT_TRAIN_STEPS": "3250",
+    "MYOPT_SCHEDULE_STEPS": "3250",
+    "MYOPT_VAL_TOKENS": "10485760",
+    "MYOPT_MID_VAL_FREQ": "125",
+    "MYOPT_MID_VAL_START": "3251",
+    "MYOPT_LATE_VAL_FREQ": "125",
+    "MYOPT_LATE_VAL_START": "3251",
+    "MYOPT_UW_FLOOR_MODE": "fixed",
+    "MYOPT_UW_FLOOR_C": "0.35",
+    "MYOPT_UW_FLOOR_EPS": "1e-8"
+  },
+  "expected_outputs": [
+    "raw/seed42_normuon_benchmark9_uwfloor_c0p35.txt",
+    "raw/seed42_normuon_benchmark9_uwfloor_c0p35_val_loss.jsonl",
+    "raw/seed42_normuon_benchmark9_uwfloor_c0p35_u_over_w.json",
+    "resolved_config.json"
+  ]
+}

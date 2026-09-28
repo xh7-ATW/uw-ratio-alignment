@@ -1,0 +1,15 @@
+launch_time_utc=2026-09-09T04:29:15Z
+repo_root=../../../..
+iclr_dir=../../../../records/track_3_optimization/results/iclr_code
+run_root=../../../../records/track_3_optimization/results/iclr_code/runs/random5_shared_uwfloor_c0p35_wdfree_20260909T042915Z
+seeds=161317530 1490436515 1391286422 1892922382 681062724
+scheme=plain_muon
+matrix_lr=0.035
+matrix_wd=0
+uw_floor_mode=fixed
+uw_floor_c=0.35
+cuda_visible_devices=0
+nproc_per_node=1
+GPU 0: NVIDIA H100 80GB HBM3
+index, name, driver_version, memory.total [MiB]
+0, NVIDIA H100 80GB HBM3, 580.173.02, 81559 MiB

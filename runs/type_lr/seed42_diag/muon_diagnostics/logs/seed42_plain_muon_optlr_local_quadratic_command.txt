@@ -1,0 +1,11 @@
+launch_time_utc=2026-09-01T15:31:55Z
+job=opt_muon_hvp
+scheme=plain_muon
+lrwd_mode=opt
+diag_mode=local_quadratic
+save_diag=1
+uw_floor_mode=off
+uw_floor_c=0
+uw_floor_calibration_step=400
+raw_log=../../../../records/track_3_optimization/results/iclr_code/runs/seed42_correct_diag250_cooldown0p7/opt_muon_hvp/raw/seed42_plain_muon_optlr_local_quadratic.txt
+command=torchrun --standalone --nproc_per_node=1 ../../../../records/track_3_optimization/results/iclr_code/scripts/train/train_alignment.py 

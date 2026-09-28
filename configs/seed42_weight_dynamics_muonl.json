@@ -1,0 +1,10 @@
+{
+  "schema_version": 1, "experiment_name": "seed42_weight_dynamics_muonl",
+  "description": "Figure 8 MuonL weight dynamics.", "seed": 42,
+  "default_run_dir": "outputs/weight_dynamics/muonl", "log_stem": "seed42_weight_dynamics_muonl",
+  "training": {"script": "pipeline/train/train_alignment.py", "torchrun": "torchrun", "nproc_per_node": 1},
+  "environment": {"MYOPT_SCHEME": "alllayer_muonl", "MYOPT_SAVE_LOG": "1", "MYOPT_SAVE_DIAG": "0",
+    "MYOPT_SAVE_VAL_LOSS_JSONL": "1", "MYOPT_SAVE_WEIGHT_NORMS": "1", "MYOPT_WEIGHT_NORM_FREQ": "1",
+    "MYOPT_LR": "0.035", "MYOPT_WD": "0.025", "MYOPT_COOLDOWN_FRAC": "0.7",
+    "MYOPT_TRAIN_STEPS": "3300", "MYOPT_SCHEDULE_STEPS": "3300", "MYOPT_VAL_TOKENS": "10485760"}
+}

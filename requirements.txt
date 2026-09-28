@@ -1,0 +1,15 @@
+# Verified analysis/plotting environment:
+#   Python 3.12.11
+#   NumPy 1.26.4
+#   Matplotlib 3.8.2
+#
+# Verified training environment:
+#   PyTorch 2.10.0+cu128, torch.version.cuda == 12.8
+#   Single-process torchrun on NVIDIA H100/H200-class GPUs
+#
+# If your package index cannot resolve the CUDA-tagged torch wheel directly,
+# install the matching CUDA 12.8 PyTorch wheel following the PyTorch install
+# selector, then install the remaining packages below.
+numpy==1.26.4
+matplotlib==3.8.2
+torch==2.10.0

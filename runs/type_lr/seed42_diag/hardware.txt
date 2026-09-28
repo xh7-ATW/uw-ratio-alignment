@@ -1,0 +1,6 @@
+launch_time_utc=2026-09-01T15:28:36Z
+repo_root=../../../..
+iclr_dir=../../../../records/track_3_optimization/results/iclr_code
+run_root=../../../../records/track_3_optimization/results/iclr_code/runs/seed42_correct_diag250_cooldown0p7
+cuda_visible_devices=0
+nproc_per_node=1

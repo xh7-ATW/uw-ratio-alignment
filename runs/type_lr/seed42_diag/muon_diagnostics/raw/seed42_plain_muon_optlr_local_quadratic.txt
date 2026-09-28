@@ -1,0 +1,3977 @@
+#!/usr/bin/env python3
+"""
+train_alignment.py
+
+Draft rerun script for the Muon / MuonL relative-step schemes:
+  plain_muon    : x_i = r_i
+  typed_muonl   : x_i = rbar_C, the same-type mean of r_i
+  alllayer_muonl: x_i = rbar_all, the all-matrix mean of r_i
+  orscale_general: OrScale general, D = weight_decay * W + Q, clipped trust ratio
+  orscale_general_decoupled_noclip:
+                  OrScale-general ablation, Q-only denominator, decoupled WD,
+                  no trust-ratio clipping
+  orscale_general_decoupled_clipped:
+                  OrScale-general ablation, Q-only denominator, decoupled WD,
+                  clipped trust ratio
+  The OrScale variants use unit shape scaling by default; set
+  MYOPT_ORSCALE_GENERAL_SHAPE_SCALE=main to apply the same
+  sqrt(max(rows/cols,1)) Muon shape scaling as the main MuonL setting.
+
+Seed defaults to 42 and can be overridden with MYOPT_SEED. The training implementation is copied from the previous
+uw_ratio_alignment implementation, with this rerun-specific wrapper:
+  - plain_muon, typed_muonl, alllayer_muonl, and the OrScale variants are accepted
+  - default matrix lr is 0.03 and matrix weight decay is 0.025
+  - per-group split LR/WD can override the shared matrix LR/WD via
+    MYOPT_QKV_*, MYOPT_ATTN_PROJ_*, MYOPT_MLP_FC_*, MYOPT_MLP_PROJ_*
+  - optional u/w floor applies to the actual step ratio eta*||U||_F/||W||_F
+  - the linear cooldown window defaults to the final 25% of schedule steps
+
+When MYOPT_DIAG_MODE=local_quadratic, every DIAG_FREQ training steps it records the
+Theory-PDF quantities around U-W ratio alignment:
+  - r_i = ||U_i||_F / ||W_i||_F and candidate x_i values
+  - <G_i,V_i>, <V_i,H_ii V_i>, and optional C_ij=<V_i,H_ij V_j>
+  - enough fields for score and sufficient-criterion postprocessing
+
+When MYOPT_DIAG_MODE=orscale, it keeps the previous OrScale diagnostic:
+  - per-block alpha_i, a_i=||G_i||_*, L_i, b_i=L_i d_i, y_i, z_i
+  - checkpoint Phi, kappa ratios, cos2, nu, and rho for plain/typed/all
+  - cached/warm-started L_i estimates so curvature is not recomputed from
+    scratch at every diagnostic checkpoint
+  - by default uses a microbatch empirical-Fisher Gram L_i proxy; exact
+    block-GGN power iteration remains available but is much slower
+  - no q/E/S/D/B stationarity diagnostics
+
+Control via environment variable:
+  MYOPT_SCHEME = plain_muon | typed_muonl | alllayer_muonl
+               | orscale_general | orscale_general_decoupled_noclip
+               | orscale_general_decoupled_clipped
+
+Output files (in this directory):
+  seed{MYOPT_SEED}_{SCHEME}_orscale.txt       training log
+  seed{MYOPT_SEED}_{SCHEME}_orscale_diag.json diagnostic records (list, one entry per checkpoint)
+"""
+
+import math
+import os
+import sys
+from pathlib import Path
+
+SCRIPT_PATH = Path(__file__).resolve()
+
+def _find_repo_root(script_path: Path) -> Path:
+    for parent in script_path.parents:
+        if (parent / "data" / "fineweb10B").is_dir():
+            return parent
+    raise RuntimeError(f"could not find repo root from {script_path}")
+
+REPO_ROOT = _find_repo_root(SCRIPT_PATH)
+TRACK_ROOT = REPO_ROOT / "records" / "track_3_optimization"
+DATA_DIR = REPO_ROOT / "data" / "fineweb10B"
+with SCRIPT_PATH.open() as f:
+    code = f.read()
+import glob
+import csv
+import json
+import re
+import time
+from contextlib import nullcontext
+
+import torch
+from torch import Tensor, nn
+from torch.optim import AdamW
+import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.func import functional_call, jvp, vjp
+
+
+########################################
+#              Dataloader              #
+########################################
+
+def _load_data_shard(file: Path):
+    header = torch.from_file(str(file), False, 256, dtype=torch.int32)
+    assert header[0] == 20240520
+    assert header[1] == 1
+    num_tokens = int(header[2])
+    with file.open("rb", buffering=0) as f:
+        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True)
+        f.seek(256 * 4)
+        nbytes = f.readinto(tokens.numpy())
+        assert nbytes == 2 * num_tokens
+    return tokens
+
+def distributed_data_generator(filename_pattern: str, batch_size: int, seq_len=1024):
+    files = sorted(Path(p) for p in glob.glob(str(filename_pattern)))
+    if not files:
+        files = sorted(Path(p) for p in glob.glob(str(REPO_ROOT / filename_pattern)))
+    assert files, f"no data shards match {filename_pattern!r}"
+    assert batch_size % dist.get_world_size() == 0
+    local_batch_size = batch_size // dist.get_world_size()
+    file_iter = iter(files)
+    tokens, pos = _load_data_shard(next(file_iter)), 0
+    while True:
+        if pos + batch_size + 1 >= len(tokens):
+            tokens, pos = _load_data_shard(next(file_iter)), 0
+        buf = tokens[pos + dist.get_rank() * local_batch_size:][:local_batch_size + 1]
+        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)
+        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True)
+        pos += batch_size
+        yield inputs.view(-1, seq_len), targets.view(-1, seq_len)
+
+
+########################################
+#             Architecture             #
+########################################
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.gains = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        return F.rms_norm(x, (x.size(-1),), weight=self.gains.type_as(x))
+
+class Linear(nn.Linear):
+    def __init__(self, in_features, out_features):
+        super().__init__(in_features, out_features, bias=True)
+
+    def forward(self, x):
+        return F.linear(x, self.weight.type_as(x), self.bias.type_as(x))
+
+class Rotary(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
+        self.register_buffer("angular_freq", torch.cat([angular_freq, angular_freq.new_zeros(dim//4)]))
+
+    def forward(self, x_BTHD: Tensor):
+        pos = torch.arange(x_BTHD.size(1), dtype=torch.float32, device=x_BTHD.device)
+        theta = torch.outer(pos, self.angular_freq)[None, :, None, :]
+        cos, sin = theta.cos(), theta.sin()
+        x1, x2 = x_BTHD.to(dtype=torch.float32).chunk(2, dim=-1)
+        y1 = x1 * cos + x2 * sin
+        y2 = x1 * (-sin) + x2 * cos
+        return torch.cat((y1, y2), 3).type_as(x_BTHD)
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, dim: int, head_dim=128):
+        super().__init__()
+        self.num_heads = dim // head_dim
+        self.head_dim = head_dim
+        hdim = self.num_heads * self.head_dim
+        self.q = Linear(dim, hdim)
+        self.k = Linear(dim, hdim)
+        self.v = Linear(dim, hdim)
+        self.proj = Linear(hdim, dim)
+        self.rotary = Rotary(head_dim)
+
+    def forward(self, x: Tensor):
+        B, T = x.size(0), x.size(1)
+        q = self.q(x).view(B, T, self.num_heads, self.head_dim)
+        k = self.k(x).view(B, T, self.num_heads, self.head_dim)
+        v = self.v(x).view(B, T, self.num_heads, self.head_dim)
+        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),))
+        q, k = self.rotary(q), self.rotary(k)
+        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2),
+                                           v.transpose(1, 2), scale=0.12, is_causal=True).transpose(1, 2)
+        y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
+        return self.proj(y)
+
+class MLP(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        hdim = 4 * dim
+        self.fc = Linear(dim, hdim)
+        self.proj = Linear(hdim, dim)
+
+    def forward(self, x: Tensor):
+        return self.proj(self.fc(x).relu().square())
+
+class Block(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.attn = CausalSelfAttention(dim)
+        self.mlp = MLP(dim)
+        self.norm1 = RMSNorm(dim)
+        self.norm2 = RMSNorm(dim)
+
+    def forward(self, x: Tensor):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+class GPT(nn.Module):
+    def __init__(self, vocab_size: int, num_layers: int, model_dim: int):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, model_dim).bfloat16()
+        self.blocks = nn.ModuleList([Block(model_dim) for _ in range(num_layers)])
+        self.proj = Linear(model_dim, vocab_size)
+        self.norm1 = RMSNorm(model_dim)
+        self.norm2 = RMSNorm(model_dim)
+
+    def forward_logits(self, inputs: Tensor) -> Tensor:
+        x = self.norm1(self.embed(inputs))
+        for block in self.blocks:
+            x = block(x)
+        logits = self.proj(self.norm2(x)).float()
+        logits = 15 * logits * (logits.square() + 15**2).rsqrt()
+        return logits
+
+    def forward(self, inputs: Tensor, targets: Tensor | None = None):
+        logits = self.forward_logits(inputs)
+        if targets is None:
+            return logits
+        return F.cross_entropy(logits.view(targets.numel(), -1), targets.view(-1), reduction="sum")
+
+
+########################################
+#              Optimizer               #
+########################################
+
+_BLOCK_WEIGHT_RE = re.compile(
+    r"^blocks\.(\d+)\.(attn\.(?:q|k|v|proj)|mlp\.(?:fc|proj))\.weight$"
+)
+
+def _matrix_kind_from_name(name: str) -> str | None:
+    m = _BLOCK_WEIGHT_RE.match(name)
+    return m.group(2).replace(".", "_") if m else None
+
+def _block_idx_from_name(name: str) -> int | None:
+    m = _BLOCK_WEIGHT_RE.match(name)
+    return int(m.group(1)) if m else None
+
+ZERO_INIT_MATRIX_KINDS = frozenset(("attn_proj", "mlp_proj"))
+ZERO_INIT_TRUST_FLOOR_SCALE = float(os.getenv("MYOPT_ZERO_INIT_TRUST_FLOOR_SCALE", "1.0"))
+if ZERO_INIT_TRUST_FLOOR_SCALE < 0.0:
+    raise ValueError("MYOPT_ZERO_INIT_TRUST_FLOOR_SCALE must be >= 0")
+
+
+def _zero_init_trust_floor(p: Tensor, scale: float = ZERO_INIT_TRUST_FLOOR_SCALE) -> Tensor:
+    if scale <= 0.0:
+        return torch.zeros((), dtype=torch.float32, device=p.device)
+    return torch.tensor(scale * math.sqrt(0.33 * p.size(0)), dtype=torch.float32, device=p.device)
+
+@torch.compile
+def zeropower_via_newtonschulz5(G: Tensor, steps: int = 12, eps: float = 1e-7) -> Tensor:
+    assert G.ndim == 2
+    X = G.bfloat16()
+    if G.size(0) > G.size(1):
+        X = X.T
+    X = X / (X.norm() + eps)
+    a, b, c = 2, -1.5, 0.5
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+    if G.size(0) > G.size(1):
+        X = X.T
+    return X.to(G.dtype)
+
+
+class DistributedMuonLKindwise(torch.optim.Optimizer):
+    """
+    Muon with several matrix scaling schemes:
+      plain     : rho=0, no weight-norm scaling (standard Muon)
+      kindwise  : rho=1, xi = EMA(||W||/mean_kind(||W||))
+      alllayer  : rho=1, xi = EMA((||W||/||U||)/mean_all(||W||/||U||))
+                  with zero-initialized weights left at scale 1, matching
+                  kindwise's zero-kind behavior but without an arbitrary norm threshold
+      lamb_align: xi = trust_norm/||U|| for each matrix, no type/all-layer mean.
+                  For zero-init projection weights,
+                  trust_norm=max(||W||, scale * sqrt(0.33 * out_dim)).
+      orscale_general:
+                  Q = NS_k(mu M + G), no Muon shape factor.
+                  D = weight_decay * W + Q, trust_ratio = max(||W||, eps)/(||D||+eps),
+                  clipped to [0.5, 1.5], and no decoupled weight decay.
+                  Zero-init projection matrices use ratio 1 until ||W|| reaches
+                  a fraction of the same-numel non-zero-init minimum ||W||.
+      orscale_general_decoupled_noclip:
+                  Q = NS_k(mu M + G), no Muon shape factor.
+                  trust_ratio = max(||W||, eps)/(||Q||+eps), no clipping.
+                  Applies decoupled weight decay outside the trust-ratio update.
+      orscale_general_decoupled_clipped:
+                  Q = NS_k(mu M + G), no Muon shape factor.
+                  trust_ratio = max(||W||, eps)/(||Q||+eps), clipped to
+                  [0.5, 1.5] by default. Applies decoupled weight decay outside
+                  the trust-ratio update.
+
+    weight_decay_mode:
+      decoupled    : apply weight decay outside the aligned update
+      wd_in_update : add weight_decay * W into U before alignment/scaling
+    """
+    def __init__(
+        self,
+        params,
+        lr=0.02,
+        weight_decay=0.0,
+        momentum=0.95,
+        ns_steps=12,
+        nesterov=True,
+        rho=1.0,
+        interval=5,
+        param_names=None,
+        eps=1e-12,
+        scheme="kindwise",
+        scale_ema_beta=0.9,
+        weight_decay_mode="decoupled",
+        orscale_r_min=0.5,
+        orscale_r_max=1.5,
+        orscale_general_shape_scale="unit",
+        orscale_zero_init_same_scale_gate_fraction=0.0,
+        uw_floor_mode="off",
+        uw_floor_c=0.0,
+        uw_floor_calibration_step=400,
+        uw_floor_eps=1e-12,
+    ):
+        assert scheme in (
+            "plain",
+            "kindwise",
+            "alllayer",
+            "lamb_align",
+            "orscale_general",
+            "orscale_general_decoupled_noclip",
+            "orscale_general_decoupled_clipped",
+        ), f"unknown scheme {scheme!r}"
+        weight_decay_mode = str(weight_decay_mode).strip().lower()
+        assert weight_decay_mode in ("decoupled", "wd_in_update"), (
+            f"unknown weight_decay_mode {weight_decay_mode!r}"
+        )
+        if scheme == "lamb_align" and weight_decay_mode != "decoupled":
+            raise ValueError("lamb_align uses decoupled weight decay; do not put weight decay into U")
+        if scheme in (
+            "orscale_general_decoupled_noclip",
+            "orscale_general_decoupled_clipped",
+        ) and weight_decay_mode != "decoupled":
+            raise ValueError(
+                f"{scheme} uses decoupled weight decay; "
+                "do not put weight decay into the trust-ratio direction"
+            )
+        if float(orscale_r_min) > float(orscale_r_max):
+            raise ValueError("orscale_r_min must be <= orscale_r_max")
+        orscale_general_shape_scale = str(orscale_general_shape_scale).strip().lower()
+        if orscale_general_shape_scale not in ("unit", "main"):
+            raise ValueError("orscale_general_shape_scale must be unit or main")
+        if float(orscale_zero_init_same_scale_gate_fraction) < 0.0:
+            raise ValueError("orscale_zero_init_same_scale_gate_fraction must be >= 0")
+        uw_floor_mode = str(uw_floor_mode).strip().lower()
+        if uw_floor_mode not in ("off", "fixed", "delayed_snapshot"):
+            raise ValueError(
+                "uw_floor_mode must be off, fixed, or delayed_snapshot"
+            )
+        if uw_floor_mode == "fixed" and float(uw_floor_c) <= 0.0:
+            raise ValueError("fixed uw_floor_mode requires uw_floor_c > 0")
+        if int(uw_floor_calibration_step) <= 0:
+            raise ValueError("uw_floor_calibration_step must be > 0")
+        if float(uw_floor_eps) <= 0.0:
+            raise ValueError("uw_floor_eps must be > 0")
+        defaults = dict(
+            lr=float(lr), weight_decay=float(weight_decay),
+            momentum=float(momentum), ns_steps=max(1, int(ns_steps)),
+            nesterov=bool(nesterov), rho=float(rho) if scheme != "plain" else 0.0,
+            interval=int(interval), eps=float(eps),
+            scheme=scheme, scale_ema_beta=float(scale_ema_beta),
+            weight_decay_mode=weight_decay_mode,
+            orscale_r_min=float(orscale_r_min),
+            orscale_r_max=float(orscale_r_max),
+            orscale_general_shape_scale=orscale_general_shape_scale,
+            orscale_zero_init_same_scale_gate_fraction=float(
+                orscale_zero_init_same_scale_gate_fraction
+            ),
+            uw_floor_mode=uw_floor_mode,
+            uw_floor_c=float(uw_floor_c),
+            uw_floor_calibration_step=int(uw_floor_calibration_step),
+            uw_floor_eps=float(uw_floor_eps),
+            uw_floor_snapshot_target=None,
+            uw_floor_snapshot_step=None,
+        )
+        super().__init__(params, defaults)
+        self.global_step = 0
+        self.scheme = scheme
+        self.uw_floor_snapshot_target: float | None = None
+        self.uw_floor_snapshot_step: int | None = None
+        self._param_kind_by_id: dict[int, str] = {}
+        self._param_block_by_id: dict[int, int] = {}
+        self._param_name_by_id: dict[int, str] = {}
+
+        if param_names is not None:
+            name_by_id = (param_names if isinstance(param_names, dict)
+                          else {id(p): n for n, p in zip(param_names,
+                                [p for g in self.param_groups for p in g["params"]])})
+            for group in self.param_groups:
+                for p in group["params"]:
+                    name = name_by_id.get(id(p))
+                    if name is None:
+                        continue
+                    self._param_name_by_id[id(p)] = name
+                    self._param_kind_by_id[id(p)] = _matrix_kind_from_name(name) or f"shape:{tuple(p.shape)}"
+                    bidx = _block_idx_from_name(name)
+                    if bidx is not None:
+                        self._param_block_by_id[id(p)] = bidx
+
+    def _matrix_kind(self, p: Tensor) -> str:
+        return self._param_kind_by_id.get(id(p), f"shape:{tuple(p.shape)}")
+
+    def _update_relative_scale_ema(self, p: Tensor, raw_scale: Tensor, beta: float) -> Tensor:
+        state = self.state[p]
+        raw_scale = raw_scale.to(device=p.device, dtype=torch.float32)
+        if beta <= 0.0:
+            state["relative_scale_ema"] = raw_scale.clone()
+            state["relative_scale_ema_updates"] = 1
+            return raw_scale
+        if "relative_scale_ema" not in state:
+            state["relative_scale_ema"] = torch.zeros((), dtype=torch.float32, device=p.device)
+            state["relative_scale_ema_updates"] = 0
+        ema = state["relative_scale_ema"]
+        ema.mul_(beta).add_(raw_scale, alpha=1.0 - beta)
+        updates = int(state.get("relative_scale_ema_updates", 0)) + 1
+        state["relative_scale_ema_updates"] = updates
+        bias_correction = max(float(state.get("eps", 1e-12)), 1.0 - beta ** updates)
+        return ema / bias_correction
+
+    def _ensure_param_state(self, p: Tensor) -> dict:
+        state = self.state[p]
+        if "momentum_buffer" not in state:
+            state["momentum_buffer"] = torch.zeros_like(p)
+            state.setdefault("matrix_kind", self._matrix_kind(p))
+            state.setdefault("cached_w_norm", torch.ones((), dtype=torch.float32, device=p.device))
+            state.setdefault("cached_relative_scale", torch.ones((), dtype=torch.float32, device=p.device))
+        return state
+
+    def _add_weight_decay_to_update(self, p: Tensor, update: Tensor, weight_decay: float) -> Tensor:
+        if self.defaults["weight_decay_mode"] != "wd_in_update" or weight_decay == 0.0:
+            return update
+        return update.add(p.detach().to(device=update.device, dtype=update.dtype), alpha=weight_decay)
+
+    def _floor_candidate_update_without_mutating_momentum(
+        self,
+        p: Tensor,
+        group: dict,
+    ) -> Tensor:
+        state = self._ensure_param_state(p)
+        beta = float(group["momentum"])
+        ns_steps = max(1, int(group["ns_steps"]))
+        nesterov = bool(group["nesterov"])
+        grad = p.grad.detach()
+        buf_old = state["momentum_buffer"].detach()
+        buf_next = torch.lerp(buf_old, grad, 1.0 - beta)
+        update_buffer = torch.lerp(grad, buf_next, beta) if nesterov else buf_next
+        update = zeropower_via_newtonschulz5(update_buffer, steps=ns_steps)
+        update *= max(1, update.size(-2) / update.size(-1)) ** 0.5
+        update = self._add_weight_decay_to_update(
+            p, update, float(group["weight_decay"])
+        )
+        rho = float(group["rho"])
+        if rho > 0.0:
+            rel = state["cached_relative_scale"].to(dtype=update.dtype)
+            update = update * rel.pow(rho)
+        return update
+
+    def _actual_uw_ratio(self, p: Tensor, update: Tensor, lr: float) -> Tensor:
+        eps = float(self.defaults["uw_floor_eps"])
+        p_norm = torch.linalg.vector_norm(p.detach().float()).clamp_min(eps)
+        update_norm = torch.linalg.vector_norm(update.detach().float())
+        return update_norm.mul(float(lr)) / p_norm
+
+    def _maybe_set_delayed_uw_floor_target(self, world_size: int, rank: int) -> None:
+        if str(self.defaults["uw_floor_mode"]) != "delayed_snapshot":
+            return
+        if self.uw_floor_snapshot_target is not None:
+            return
+        step_index = self.global_step + 1
+        if step_index < int(self.defaults["uw_floor_calibration_step"]):
+            return
+
+        device = self.param_groups[0]["params"][0].device
+        local = torch.zeros(2, device=device, dtype=torch.float64)
+        for group in self.param_groups:
+            params = group["params"]
+            for base_i in range(0, len(params), world_size):
+                local_i = base_i + rank
+                if local_i >= len(params):
+                    continue
+                p = params[local_i]
+                if p.grad is None or p.ndim < 2:
+                    continue
+                update = self._floor_candidate_update_without_mutating_momentum(p, group)
+                ratio = self._actual_uw_ratio(p, update, float(group["lr"]))
+                if bool(torch.isfinite(ratio).item()):
+                    local[0].add_(ratio.to(dtype=torch.float64))
+                    local[1].add_(1.0)
+
+        dist.all_reduce(local, op=dist.ReduceOp.SUM)
+        count = int(local[1].item())
+        target = float((local[0] / local[1]).item()) if count > 0 else 0.0
+        self.uw_floor_snapshot_target = target
+        self.uw_floor_snapshot_step = step_index
+        self.defaults["uw_floor_snapshot_target"] = target
+        self.defaults["uw_floor_snapshot_step"] = step_index
+        if rank == 0:
+            print(
+                f"uw_floor_snapshot step:{step_index} target:{target:.10g} count:{count}",
+                flush=True,
+            )
+
+    def _active_uw_floor_target(self) -> float | None:
+        mode = str(self.defaults["uw_floor_mode"])
+        if mode == "fixed":
+            return float(self.defaults["uw_floor_c"])
+        if mode == "delayed_snapshot":
+            return self.uw_floor_snapshot_target
+        return None
+
+    def _apply_uw_floor_to_update(
+        self,
+        p: Tensor,
+        update: Tensor,
+        lr: float,
+        target: float | None,
+    ) -> Tensor:
+        mode = str(self.defaults["uw_floor_mode"])
+        state = self.state[p]
+        if target is None or target <= 0.0 or lr <= 0.0:
+            state["uw_floor_mode"] = mode
+            state["uw_floor_raw_ratio"] = self._actual_uw_ratio(p, update, lr).detach().float()
+            state["uw_floor_target"] = None
+            state["uw_floor_scale"] = torch.ones((), device=p.device, dtype=torch.float32)
+            state["uw_floor_applied"] = False
+            state["uw_floor_snapshot_step"] = self.uw_floor_snapshot_step
+            return update
+
+        eps = float(self.defaults["uw_floor_eps"])
+        p_norm = torch.linalg.vector_norm(p.detach().float()).clamp_min(eps)
+        update_norm = torch.linalg.vector_norm(update.detach().float())
+        raw_ratio = update_norm.mul(float(lr)) / p_norm
+        target_t = torch.tensor(float(target), device=p.device, dtype=torch.float32)
+        denom = update_norm.mul(float(lr)).clamp_min(eps)
+        scale = torch.where(
+            raw_ratio < target_t,
+            target_t * p_norm / denom,
+            torch.ones_like(raw_ratio),
+        )
+        state["uw_floor_mode"] = mode
+        state["uw_floor_raw_ratio"] = raw_ratio.detach().float()
+        state["uw_floor_target"] = target_t.detach()
+        state["uw_floor_scale"] = scale.detach().float()
+        state["uw_floor_applied"] = bool((scale > 1.0).item())
+        state["uw_floor_snapshot_step"] = self.uw_floor_snapshot_step
+        return update * scale.to(dtype=update.dtype)
+
+    def _apply_weight_decay_and_update(
+        self,
+        p: Tensor,
+        update: Tensor,
+        lr: float,
+        weight_decay: float,
+    ) -> None:
+        if self.defaults["weight_decay_mode"] == "decoupled" and weight_decay != 0.0:
+            p.mul_(1 - lr * weight_decay)
+        p.add_(update.reshape_as(p), alpha=-lr)
+
+    @torch.no_grad()
+    def _refresh_all_scales(self) -> None:
+        """Refresh cached_relative_scale for all matrix params (all groups)."""
+        if self.scheme in ("plain", "alllayer", "lamb_align"):
+            return
+
+        interval = self.defaults["interval"]
+        needs_refresh = (
+            any("cached_relative_scale" not in self.state[p]
+                for group in self.param_groups
+                for p in group["params"] if p.ndim >= 2)
+            or self.global_step % interval == 0
+        )
+        if not needs_refresh:
+            return
+
+        all_matrix = [(p, group)
+                      for group in self.param_groups
+                      for p in group["params"] if p.ndim >= 2]
+        eps = self.defaults["eps"]
+        beta = self.defaults["scale_ema_beta"]
+
+        norms = {id(p): torch.linalg.vector_norm(p.detach().float()) for p, _ in all_matrix}
+
+        by_kind: dict[str, list] = {}
+        for p, _ in all_matrix:
+            by_kind.setdefault(self._matrix_kind(p), []).append(p)
+        for kind, params_k in by_kind.items():
+            avg_norm_unclamped = torch.stack([norms[id(p)] for p in params_k]).mean()
+            avg_k = avg_norm_unclamped.clamp_min(eps)
+            zero_kind = bool(avg_norm_unclamped <= eps)
+            for p in params_k:
+                raw = torch.ones_like(norms[id(p)]) if zero_kind else norms[id(p)] / avg_k
+                self.state[p]["cached_relative_scale"] = self._update_relative_scale_ema(p, raw, beta)
+                self.state[p]["cached_w_norm"] = norms[id(p)]
+                self.state[p]["matrix_kind"] = kind
+
+    @torch.no_grad()
+    def step(self):
+        if self.scheme in (
+            "orscale_general",
+            "orscale_general_decoupled_noclip",
+            "orscale_general_decoupled_clipped",
+        ):
+            self._step_orscale_general()
+            return
+        if self.scheme == "alllayer":
+            self._step_alllayer_ratio_aligned()
+            return
+        if self.scheme == "lamb_align":
+            self._step_lamb_align()
+            return
+
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        self._refresh_all_scales()
+        self._maybe_set_delayed_uw_floor_target(world_size, rank)
+        uw_floor_target = self._active_uw_floor_target()
+
+        for group in self.param_groups:
+            beta = float(group["momentum"])
+            ns_steps = max(1, int(group["ns_steps"]))
+            nesterov = bool(group["nesterov"])
+            rho = float(group["rho"])
+            params = group["params"]
+            params_pad = params + [torch.empty_like(params[-1])] * (world_size - len(params) % world_size)
+
+            for base_i in range(0, len(params), world_size):
+                if base_i + rank < len(params):
+                    p = params[base_i + rank]
+                    if p.grad is not None:
+                        state = self._ensure_param_state(p)
+                        grad = p.grad
+                        buf = state["momentum_buffer"]
+                        buf.lerp_(grad, 1 - beta)
+                        update = grad.lerp_(buf, beta) if nesterov else buf
+                        state["last_update_buffer_pre_ns"] = update.detach().clone()
+                        update = zeropower_via_newtonschulz5(update, steps=ns_steps)
+                        update *= max(1, update.size(-2) / update.size(-1)) ** 0.5
+                        update = self._add_weight_decay_to_update(
+                            p, update, float(group["weight_decay"])
+                        )
+                        if rho > 0.0:
+                            rel = state["cached_relative_scale"].to(dtype=update.dtype)
+                            update = update * rel.pow(rho)
+                        update = self._apply_uw_floor_to_update(
+                            p,
+                            update,
+                            float(group["lr"]),
+                            uw_floor_target,
+                        )
+
+                        self._apply_weight_decay_and_update(
+                            p,
+                            update,
+                            float(group["lr"]),
+                            float(group["weight_decay"]),
+                        )
+
+                dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
+
+        self.global_step += 1
+
+    @torch.no_grad()
+    def _step_orscale_general(self):
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        eps = float(self.defaults["eps"])
+        r_min = float(self.defaults["orscale_r_min"])
+        r_max = float(self.defaults["orscale_r_max"])
+        decoupled_variant = self.scheme in (
+            "orscale_general_decoupled_noclip",
+            "orscale_general_decoupled_clipped",
+        )
+        clip_trust_ratio = self.scheme != "orscale_general_decoupled_noclip"
+        variant_label = {
+            "orscale_general": "coupled_clipped",
+            "orscale_general_decoupled_noclip": "decoupled_noclip",
+            "orscale_general_decoupled_clipped": "decoupled_clipped",
+        }[self.scheme]
+        gate_fraction = (
+            0.0
+            if decoupled_variant
+            else float(self.defaults["orscale_zero_init_same_scale_gate_fraction"])
+        )
+
+        w_norm_by_id: dict[int, Tensor] = {}
+        same_scale_normal_min: dict[int, Tensor] = {}
+        same_scale_normal_count: dict[int, int] = {}
+        if gate_fraction > 0.0:
+            for group in self.param_groups:
+                for p in group["params"]:
+                    if p.ndim < 2:
+                        continue
+                    w_norm = torch.linalg.vector_norm(p.detach().float())
+                    w_norm_by_id[id(p)] = w_norm
+                    if self._matrix_kind(p) in ZERO_INIT_MATRIX_KINDS:
+                        continue
+                    if not bool(torch.isfinite(w_norm).item()):
+                        continue
+                    if float(w_norm.item()) <= eps:
+                        continue
+                    key = int(p.numel())
+                    same_scale_normal_count[key] = same_scale_normal_count.get(key, 0) + 1
+                    current = same_scale_normal_min.get(key)
+                    same_scale_normal_min[key] = w_norm if current is None else torch.minimum(current, w_norm)
+
+        for group in self.param_groups:
+            beta = float(group["momentum"])
+            ns_steps = max(1, int(group["ns_steps"]))
+            nesterov = bool(group["nesterov"])
+            lr = float(group["lr"])
+            wd = float(group["weight_decay"])
+            shape_scale_mode = str(group["orscale_general_shape_scale"])
+            params = group["params"]
+            params_pad = params + [torch.empty_like(params[-1])] * (world_size - len(params) % world_size)
+
+            for base_i in range(0, len(params), world_size):
+                if base_i + rank < len(params):
+                    p = params[base_i + rank]
+                    if p.grad is not None:
+                        state = self._ensure_param_state(p)
+                        grad = p.grad
+                        buf = state["momentum_buffer"]
+                        buf.mul_(beta).add_(grad)
+                        update_pre_ns = grad.add(buf, alpha=beta) if nesterov else buf
+                        q = zeropower_via_newtonschulz5(update_pre_ns, steps=ns_steps).float()
+                        shape_scale = 1.0
+                        if shape_scale_mode == "main":
+                            shape_scale = max(1.0, q.size(-2) / q.size(-1)) ** 0.5
+                            q.mul_(shape_scale)
+                        direction = q
+                        if wd != 0.0 and not decoupled_variant:
+                            direction = direction.add(
+                                p.detach().to(device=direction.device, dtype=direction.dtype),
+                                alpha=wd,
+                            )
+
+                        w_norm = w_norm_by_id.get(id(p))
+                        if w_norm is None:
+                            w_norm = torch.linalg.vector_norm(p.detach().float())
+                        direction_norm = torch.linalg.vector_norm(direction.detach().float())
+                        raw_ratio = w_norm.clamp_min(eps) / direction_norm.add(eps)
+                        clipped_ratio = (
+                            torch.clamp(raw_ratio, min=r_min, max=r_max)
+                            if clip_trust_ratio
+                            else raw_ratio
+                        )
+                        effective_ratio = clipped_ratio
+
+                        kind = self._matrix_kind(p)
+                        gate_enabled = bool(gate_fraction > 0.0 and kind in ZERO_INIT_MATRIX_KINDS)
+                        gate_open = True
+                        gate_status = "standard"
+                        gate_threshold = None
+                        same_scale_min = None
+                        same_scale_count = 0
+                        if gate_enabled:
+                            key = int(p.numel())
+                            same_scale_min = same_scale_normal_min.get(key)
+                            same_scale_count = int(same_scale_normal_count.get(key, 0))
+                            gate_open = False
+                            if same_scale_min is not None:
+                                gate_threshold = same_scale_min.to(device=w_norm.device, dtype=torch.float32) * gate_fraction
+                                gate_open = bool(float(w_norm.item()) >= float(gate_threshold.item()))
+                                gate_status = "same_scale_gate_open" if gate_open else "same_scale_bootstrap_ratio_1"
+                            else:
+                                gate_status = "same_scale_min_unavailable_ratio_1"
+                            if not gate_open:
+                                effective_ratio = torch.ones_like(clipped_ratio)
+
+                        state["last_update_buffer_pre_ns"] = update_pre_ns.detach().clone()
+                        state["cached_w_norm"] = w_norm.detach().to(device=p.device, dtype=torch.float32)
+                        state["cached_relative_scale"] = effective_ratio.detach().to(device=p.device, dtype=torch.float32)
+                        state["matrix_kind"] = kind
+                        state["orscale_general_q_norm"] = torch.linalg.vector_norm(q.detach().float()).to(
+                            device=p.device, dtype=torch.float32
+                        )
+                        state["orscale_general_direction_norm"] = direction_norm.detach().to(
+                            device=p.device, dtype=torch.float32
+                        )
+                        state["orscale_general_raw_trust_ratio"] = raw_ratio.detach().to(
+                            device=p.device, dtype=torch.float32
+                        )
+                        state["orscale_general_clipped_trust_ratio"] = clipped_ratio.detach().to(
+                            device=p.device, dtype=torch.float32
+                        )
+                        state["orscale_general_effective_trust_ratio"] = effective_ratio.detach().to(
+                            device=p.device, dtype=torch.float32
+                        )
+                        state["orscale_general_zero_init_same_scale_gate_enabled"] = gate_enabled
+                        state["orscale_general_zero_init_same_scale_gate_open"] = gate_open
+                        state["orscale_general_zero_init_same_scale_gate_status"] = gate_status
+                        state["orscale_general_zero_init_same_scale_gate_fraction"] = gate_fraction
+                        state["orscale_general_same_scale_normal_w_norm_min"] = (
+                            same_scale_min.detach().to(device=p.device, dtype=torch.float32)
+                            if same_scale_min is not None else None
+                        )
+                        state["orscale_general_same_scale_normal_w_norm_count"] = same_scale_count
+                        state["orscale_general_w_norm_gate_threshold"] = (
+                            gate_threshold.detach().to(device=p.device, dtype=torch.float32)
+                            if gate_threshold is not None else None
+                        )
+                        state["orscale_general_variant"] = variant_label
+                        state["orscale_general_shape_scale"] = torch.tensor(
+                            shape_scale, dtype=torch.float32, device=p.device
+                        )
+                        state["orscale_general_shape_scale_mode"] = shape_scale_mode
+                        state["orscale_general_weight_decay_coupled_in_direction"] = (
+                            bool(wd != 0.0 and not decoupled_variant)
+                        )
+                        state["orscale_general_decoupled_weight_decay_applied"] = (
+                            bool(wd != 0.0 and decoupled_variant)
+                        )
+                        state["orscale_general_trust_ratio_clipped"] = bool(clip_trust_ratio)
+                        state["orscale_general_clip_min"] = r_min if clip_trust_ratio else None
+                        state["orscale_general_clip_max"] = r_max if clip_trust_ratio else None
+
+                        scaled_direction = direction * effective_ratio.to(device=direction.device, dtype=direction.dtype)
+                        if decoupled_variant:
+                            self._apply_weight_decay_and_update(
+                                p,
+                                scaled_direction.reshape_as(p).to(dtype=p.dtype),
+                                lr,
+                                wd,
+                            )
+                        else:
+                            p.add_(scaled_direction.reshape_as(p).to(dtype=p.dtype), alpha=-lr)
+
+                dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
+
+        self.global_step += 1
+
+    @torch.no_grad()
+    def _step_lamb_align(self):
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        eps = float(self.defaults["eps"])
+
+        for group in self.param_groups:
+            beta = float(group["momentum"])
+            ns_steps = max(1, int(group["ns_steps"]))
+            nesterov = bool(group["nesterov"])
+            lr = float(group["lr"])
+            wd = float(group["weight_decay"])
+            params = group["params"]
+            params_pad = params + [torch.empty_like(params[-1])] * (world_size - len(params) % world_size)
+
+            for base_i in range(0, len(params), world_size):
+                if base_i + rank < len(params):
+                    p = params[base_i + rank]
+                    if p.grad is not None:
+                        state = self._ensure_param_state(p)
+                        grad = p.grad
+                        buf = state["momentum_buffer"]
+                        buf.lerp_(grad, 1 - beta)
+                        update = grad.lerp_(buf, beta) if nesterov else buf
+                        state["last_update_buffer_pre_ns"] = update.detach().clone()
+                        update = zeropower_via_newtonschulz5(update, steps=ns_steps)
+                        update *= max(1, update.size(-2) / update.size(-1)) ** 0.5
+
+                        w_norm = torch.linalg.vector_norm(p.detach().float())
+                        update_norm = torch.linalg.vector_norm(update.detach().float()).clamp_min(eps)
+                        kind = self._matrix_kind(p)
+                        trust_floor = None
+                        trust_floor_source = "none"
+                        trust_norm = w_norm
+                        used_trust_floor = False
+                        if kind in ZERO_INIT_MATRIX_KINDS:
+                            trust_floor = _zero_init_trust_floor(p)
+                            trust_floor_source = f"expected_init_norm_x{ZERO_INIT_TRUST_FLOOR_SCALE:g}"
+                            trust_norm = torch.maximum(w_norm, trust_floor)
+                            used_trust_floor = bool(float(w_norm.item()) < float(trust_floor.item()))
+                        if float(trust_norm.item()) > eps:
+                            coeff = (trust_norm / update_norm).to(device=p.device, dtype=update.dtype)
+                        else:
+                            coeff = torch.ones((), dtype=update.dtype, device=p.device)
+                        state["cached_w_norm"] = w_norm.detach().to(device=p.device, dtype=torch.float32)
+                        state["cached_relative_scale"] = coeff.detach().to(device=p.device, dtype=torch.float32)
+                        state["matrix_kind"] = kind
+                        state["lamb_align_trust_norm"] = trust_norm.detach().to(device=p.device, dtype=torch.float32)
+                        state["lamb_align_used_trust_floor"] = used_trust_floor
+                        state["lamb_align_trust_floor"] = (
+                            trust_floor.detach().to(device=p.device, dtype=torch.float32)
+                            if trust_floor is not None else None
+                        )
+                        state["lamb_align_trust_floor_source"] = trust_floor_source
+                        state["lamb_align_zero_init_trust_floor_scale"] = ZERO_INIT_TRUST_FLOOR_SCALE
+
+                        self._apply_weight_decay_and_update(p, update * coeff, lr, wd)
+
+                dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
+
+        self.global_step += 1
+
+    @torch.no_grad()
+    def _step_alllayer_ratio_aligned(self):
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        eps = float(self.defaults["eps"])
+        interval = int(self.defaults["interval"])
+        beta_ema = float(self.defaults["scale_ema_beta"])
+        needs_refresh = self.global_step % interval == 0
+
+        first_param = next(p for group in self.param_groups for p in group["params"])
+        ratio_sum = torch.zeros((), dtype=torch.float32, device=first_param.device)
+        ratio_count = torch.zeros((), dtype=torch.float32, device=first_param.device)
+        pending_by_group = []
+
+        for group in self.param_groups:
+            beta = float(group["momentum"])
+            ns_steps = max(1, int(group["ns_steps"]))
+            nesterov = bool(group["nesterov"])
+            wd = float(group["weight_decay"])
+            params = group["params"]
+            params_pad = params + [torch.empty_like(params[-1])] * (world_size - len(params) % world_size)
+            pending = []
+
+            for base_i in range(0, len(params), world_size):
+                if base_i + rank < len(params):
+                    p = params[base_i + rank]
+                    if p.grad is not None:
+                        state = self._ensure_param_state(p)
+                        if "relative_scale_ema" not in state:
+                            needs_refresh = True
+                        grad = p.grad
+                        buf = state["momentum_buffer"]
+                        buf.lerp_(grad, 1 - beta)
+                        update = grad.lerp_(buf, beta) if nesterov else buf
+                        state["last_update_buffer_pre_ns"] = update.detach().clone()
+                        update = zeropower_via_newtonschulz5(update, steps=ns_steps)
+                        update *= max(1, update.size(-2) / update.size(-1)) ** 0.5
+                        update = self._add_weight_decay_to_update(p, update, wd)
+
+                        w_norm = torch.linalg.vector_norm(p.detach().float())
+                        update_norm = torch.linalg.vector_norm(update.detach().float()).clamp_min(eps)
+                        zero_weight = bool(float(w_norm.item()) <= eps)
+                        ratio = None
+                        if needs_refresh and not zero_weight:
+                            ratio = w_norm / update_norm
+                            ratio_sum.add_(ratio.detach().float())
+                            ratio_count.add_(1.0)
+
+                        state["cached_w_norm"] = w_norm.detach().to(device=p.device, dtype=torch.float32)
+                        state["matrix_kind"] = self._matrix_kind(p)
+                        pending.append((p, update, state, ratio))
+
+            pending_by_group.append((group, params, params_pad, pending))
+
+        ratio_mean = None
+        zero_all = False
+        if needs_refresh:
+            dist.all_reduce(ratio_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(ratio_count, op=dist.ReduceOp.SUM)
+            ratio_mean = ratio_sum / ratio_count.clamp_min(1.0)
+            zero_all = bool(float(ratio_mean.item()) <= eps)
+
+        for group, params, params_pad, pending in pending_by_group:
+            lr = float(group["lr"])
+            wd = float(group["weight_decay"])
+            rho = float(group["rho"])
+            for p, update, state, ratio in pending:
+                if needs_refresh:
+                    if ratio is None or rho <= 0.0 or zero_all:
+                        raw_coeff = torch.ones((), dtype=torch.float32, device=p.device)
+                    else:
+                        raw_coeff = (ratio / ratio_mean.clamp_min(eps)).pow(rho)
+                        raw_coeff = raw_coeff.to(device=p.device, dtype=torch.float32)
+                    state["cached_relative_scale"] = self._update_relative_scale_ema(p, raw_coeff, beta_ema)
+                coeff = state["cached_relative_scale"].to(device=p.device, dtype=update.dtype)
+                self._apply_weight_decay_and_update(p, update * coeff, lr, wd)
+
+            for base_i in range(0, len(params), world_size):
+                dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
+
+        self.global_step += 1
+
+
+########################################
+#             Diagnostics              #
+########################################
+
+def _ns5_and_shape_scale(buf: Tensor, ns_steps: int) -> tuple[Tensor, float]:
+    """Returns (vi_raw, shape_scale) where vi_raw is the Muon update to subtract."""
+    buf_2d = buf.view(buf.shape[0], -1).float()
+    vi_2d = zeropower_via_newtonschulz5(buf_2d, steps=ns_steps).float()
+    shape_scale = max(1.0, vi_2d.size(-2) / vi_2d.size(-1)) ** 0.5
+    vi_raw = vi_2d * shape_scale
+    return vi_raw.reshape(buf.shape), shape_scale
+
+
+def _safe_float(x) -> float:
+    v = float(x)
+    return v if math.isfinite(v) else None
+
+
+def _safe_float_or_none(x) -> float | None:
+    if x is None:
+        return None
+    return _safe_float(x)
+
+
+def _tensor_to_matrix(t: Tensor) -> Tensor:
+    if t.ndim < 2:
+        raise ValueError(f"expected matrix-like tensor, got shape={tuple(t.shape)}")
+    if t.ndim == 2:
+        return t
+    return t.reshape(t.shape[0], -1)
+
+
+def _safe_ratio(num: float, den: float) -> float | None:
+    if not (math.isfinite(num) and math.isfinite(den)) or abs(den) <= 1e-30:
+        return None
+    return num / den
+
+
+def _population_nu(values: list[float]) -> float | None:
+    if not values:
+        return None
+    mean = sum(values) / len(values)
+    if abs(mean) <= 1e-30:
+        return None
+    var = sum((v - mean) ** 2 for v in values) / len(values)
+    return var / (mean * mean)
+
+
+def _pearson_corr(xs: list[float], ys: list[float]) -> float | None:
+    if len(xs) != len(ys) or len(xs) < 2:
+        return None
+    mx = sum(xs) / len(xs)
+    my = sum(ys) / len(ys)
+    vx = sum((x - mx) ** 2 for x in xs)
+    vy = sum((y - my) ** 2 for y in ys)
+    den = (vx * vy) ** 0.5
+    if den <= 1e-30:
+        return None
+    return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den
+
+
+def _scheme_orscale_stats(
+    *,
+    alpha: list[float],
+    a_vals: list[float],
+    b_vals: list[float],
+    z_vals: list[float],
+) -> dict:
+    y_vals = [al * math.sqrt(max(bi, 0.0)) for al, bi in zip(alpha, b_vals)]
+    numerator = sum(al * ai for al, ai in zip(alpha, a_vals))
+    denominator = sum(bi * al * al for bi, al in zip(b_vals, alpha))
+    phi = (numerator * numerator / denominator) if denominator > 0.0 else None
+
+    yz_dot = sum(z * y for z, y in zip(z_vals, y_vals))
+    z_norm_sq = sum(z * z for z in z_vals)
+    y_norm_sq = sum(y * y for y in y_vals)
+    cos2 = (
+        yz_dot * yz_dot / (z_norm_sq * y_norm_sq)
+        if z_norm_sq > 0.0 and y_norm_sq > 0.0 else None
+    )
+    nu = _population_nu(y_vals)
+    rho = _pearson_corr(y_vals, z_vals)
+    return {
+        "Phi": _safe_float(phi) if phi is not None else None,
+        "sum_alpha_a": _safe_float(numerator),
+        "sum_b_alpha_sq": _safe_float(denominator),
+        "cos2": _safe_float(cos2) if cos2 is not None else None,
+        "nu": _safe_float(nu) if nu is not None else None,
+        "rho": _safe_float(rho) if rho is not None else None,
+    }
+
+
+def _vector_match_stats(xs: list[float], ts: list[float]) -> dict:
+    finite_pairs = [
+        (float(x), float(t))
+        for x, t in zip(xs, ts)
+        if math.isfinite(float(x)) and math.isfinite(float(t))
+    ]
+    if not finite_pairs:
+        return {
+            "n": 0,
+            "cosine": None,
+            "pearson": None,
+            "best_scale_to_t": None,
+            "relative_l2_after_best_scale": None,
+            "direct_relative_l2": None,
+            "mean_x": None,
+            "mean_t": None,
+            "std_x": None,
+            "std_t": None,
+        }
+
+    x_vals = [p[0] for p in finite_pairs]
+    t_vals = [p[1] for p in finite_pairs]
+    dot_xt = sum(x * t for x, t in finite_pairs)
+    dot_xx = sum(x * x for x in x_vals)
+    dot_tt = sum(t * t for t in t_vals)
+    norm_prod = math.sqrt(max(dot_xx, 0.0) * max(dot_tt, 0.0))
+    cosine = dot_xt / norm_prod if norm_prod > 1e-30 else None
+    pearson = _pearson_corr(x_vals, t_vals)
+    best_scale = dot_xt / dot_xx if dot_xx > 1e-30 else None
+    if best_scale is not None and dot_tt > 1e-30:
+        rel_l2 = math.sqrt(sum((best_scale * x - t) ** 2 for x, t in finite_pairs) / dot_tt)
+    else:
+        rel_l2 = None
+    direct_rel_l2 = (
+        math.sqrt(sum((x - t) ** 2 for x, t in finite_pairs) / dot_tt)
+        if dot_tt > 1e-30 else None
+    )
+    mean_x = sum(x_vals) / len(x_vals)
+    mean_t = sum(t_vals) / len(t_vals)
+    std_x = math.sqrt(sum((x - mean_x) ** 2 for x in x_vals) / len(x_vals))
+    std_t = math.sqrt(sum((t - mean_t) ** 2 for t in t_vals) / len(t_vals))
+    return {
+        "n": len(finite_pairs),
+        "cosine": _safe_float_or_none(cosine),
+        "pearson": _safe_float_or_none(pearson),
+        "best_scale_to_t": _safe_float_or_none(best_scale),
+        "relative_l2_after_best_scale": _safe_float_or_none(rel_l2),
+        "direct_relative_l2": _safe_float_or_none(direct_rel_l2),
+        "mean_x": _safe_float(mean_x),
+        "mean_t": _safe_float(mean_t),
+        "std_x": _safe_float(std_x),
+        "std_t": _safe_float(std_t),
+    }
+
+
+def _make_block_ggn_operator(
+    *,
+    model: GPT,
+    diag_inputs: Tensor,
+    param_name: str,
+    num_tokens_diag: int,
+    ggn_microbatch_size: int,
+):
+    """Return H_GGN[delta] for one parameter block using chunked JVP/VJP on logits."""
+    params = {name: p.detach().float() for name, p in model.named_parameters()}
+    buffers = {
+        name: b.detach().float() if b.is_floating_point() else b.detach()
+        for name, b in model.named_buffers()
+    }
+    base_param = params[param_name]
+    inv_tokens = 1.0 / float(max(num_tokens_diag, 1))
+    chunk_size = max(1, int(ggn_microbatch_size))
+
+    def operator(delta: Tensor) -> Tensor:
+        delta = delta.to(device=base_param.device, dtype=base_param.dtype)
+        ggn_vec = torch.zeros_like(base_param, dtype=torch.float32)
+        for start in range(0, diag_inputs.size(0), chunk_size):
+            inputs_chunk = diag_inputs[start:start + chunk_size]
+
+            def logits_from_param(param_value: Tensor) -> Tensor:
+                local_params = dict(params)
+                local_params[param_name] = param_value
+                if inputs_chunk.is_cuda:
+                    sdp_ctx = sdpa_kernel(SDPBackend.MATH)
+                else:
+                    sdp_ctx = nullcontext()
+                with sdp_ctx:
+                    logits = functional_call(
+                        model,
+                        (local_params, buffers),
+                        args=(inputs_chunk, None),
+                        tie_weights=True,
+                        strict=False,
+                    )
+                return logits.float().reshape(-1, logits.shape[-1])
+
+            base_logits_flat, vjp_fn = vjp(logits_from_param, base_param)
+            probs = torch.softmax(base_logits_flat.detach().float(), dim=-1)
+            _, logits_tangent = jvp(logits_from_param, (base_param,), (delta,))
+            tangent = logits_tangent.float().reshape_as(probs)
+            centered = tangent - torch.sum(probs * tangent, dim=-1, keepdim=True)
+            hz_jv = probs * centered * inv_tokens
+            (chunk_vec,) = vjp_fn(hz_jv.to(dtype=base_logits_flat.dtype))
+            ggn_vec.add_(chunk_vec.detach().float())
+        if dist.is_initialized():
+            dist.all_reduce(ggn_vec, op=dist.ReduceOp.SUM)
+        return ggn_vec
+
+    return operator
+
+
+def _exact_block_hessian_vec(
+    *,
+    model: GPT,
+    diag_inputs: Tensor,
+    diag_targets: Tensor,
+    param: Tensor,
+    vector: Tensor,
+    num_tokens_diag: int,
+    hvp_microbatch_size: int,
+) -> Tensor:
+    """Return H_ii @ vector for the diagnostic per-token mean loss."""
+    hv = torch.zeros_like(param, dtype=torch.float32)
+    v = vector.detach().to(device=param.device, dtype=param.dtype)
+    chunk_size = max(1, int(hvp_microbatch_size))
+
+    for start in range(0, diag_inputs.size(0), chunk_size):
+        inputs_chunk = diag_inputs[start:start + chunk_size]
+        targets_chunk = diag_targets[start:start + chunk_size]
+        sdp_ctx = sdpa_kernel(SDPBackend.MATH) if inputs_chunk.is_cuda else nullcontext()
+        with torch.enable_grad(), sdp_ctx:
+            loss_sum = model(inputs_chunk, targets_chunk)
+            loss_mean_global = loss_sum / float(max(num_tokens_diag, 1))
+            (g,) = torch.autograd.grad(
+                loss_mean_global,
+                param,
+                create_graph=True,
+                allow_unused=True,
+            )
+            if g is None:
+                continue
+            gv = torch.sum(g * v)
+            if not gv.requires_grad:
+                continue
+            (hv_chunk,) = torch.autograd.grad(gv, param, allow_unused=True)
+        if hv_chunk is not None:
+            hv.add_(hv_chunk.detach().float())
+
+    if dist.is_initialized():
+        dist.all_reduce(hv, op=dist.ReduceOp.SUM)
+    return hv
+
+
+def _exact_source_block_hessian_vecs(
+    *,
+    model: GPT,
+    diag_inputs: Tensor,
+    diag_targets: Tensor,
+    source_param: Tensor,
+    source_vector: Tensor,
+    target_params: list[Tensor],
+    num_tokens_diag: int,
+    hvp_microbatch_size: int,
+) -> dict[int, Tensor]:
+    """Return {id(target): H_target,source @ source_vector} for the diagnostic loss."""
+    hv_by_pid = {
+        id(p): torch.zeros_like(p, dtype=torch.float32)
+        for p in target_params
+    }
+    v = source_vector.detach().to(device=source_param.device, dtype=source_param.dtype)
+    chunk_size = max(1, int(hvp_microbatch_size))
+
+    for start in range(0, diag_inputs.size(0), chunk_size):
+        inputs_chunk = diag_inputs[start:start + chunk_size]
+        targets_chunk = diag_targets[start:start + chunk_size]
+        sdp_ctx = sdpa_kernel(SDPBackend.MATH) if inputs_chunk.is_cuda else nullcontext()
+        with torch.enable_grad(), sdp_ctx:
+            loss_sum = model(inputs_chunk, targets_chunk)
+            loss_mean_global = loss_sum / float(max(num_tokens_diag, 1))
+            (g_source,) = torch.autograd.grad(
+                loss_mean_global,
+                source_param,
+                create_graph=True,
+                allow_unused=True,
+            )
+            if g_source is None:
+                continue
+            gv = torch.sum(g_source * v)
+            if not gv.requires_grad:
+                continue
+            hv_chunks = torch.autograd.grad(gv, target_params, allow_unused=True)
+        for target_param, hv_chunk in zip(target_params, hv_chunks):
+            if hv_chunk is not None:
+                hv_by_pid[id(target_param)].add_(hv_chunk.detach().float())
+
+    if dist.is_initialized():
+        for hv in hv_by_pid.values():
+            dist.all_reduce(hv, op=dist.ReduceOp.SUM)
+    return hv_by_pid
+
+
+def _estimate_block_lmax(
+    *,
+    ggn_operator,
+    shape: torch.Size,
+    device: torch.device,
+    power_iters: int,
+    seed: int,
+    floor: float,
+    initial_vector: Tensor | None = None,
+    eps: float = 1e-12,
+) -> dict:
+    gen = torch.Generator(device=device)
+    gen.manual_seed(int(seed))
+    if initial_vector is not None and tuple(initial_vector.shape) == tuple(shape):
+        u = initial_vector.to(device=device, dtype=torch.float32, non_blocking=True)
+        vector_source = "warm_start"
+    else:
+        u = torch.randn(shape, device=device, dtype=torch.float32, generator=gen)
+        vector_source = "random_init"
+    u = u / torch.linalg.vector_norm(u).clamp_min(eps)
+
+    last_norm = None
+    for _ in range(max(1, int(power_iters))):
+        z = ggn_operator(u)
+        z_norm = torch.linalg.vector_norm(z)
+        last_norm = float(z_norm)
+        if not math.isfinite(last_norm) or last_norm <= eps:
+            u = torch.randn(shape, device=device, dtype=torch.float32, generator=gen)
+            u = u / torch.linalg.vector_norm(u).clamp_min(eps)
+        else:
+            u = (z / z_norm).detach()
+
+    h_u = ggn_operator(u)
+    raw_L = float(torch.sum(u * h_u).item())
+    floor_applied = (not math.isfinite(raw_L)) or raw_L <= floor
+    L = max(raw_L if math.isfinite(raw_L) else floor, floor)
+    return {
+        "L_i": L,
+        "L_i_raw": raw_L if math.isfinite(raw_L) else None,
+        "L_i_floor_applied": bool(floor_applied),
+        "power_last_hvp_norm": last_norm,
+        "power_vector_cpu": u.detach().cpu(),
+        "power_vector_source": vector_source,
+    }
+
+
+def compute_orscale_diagnostics(
+    model: GPT,
+    optimizer2: DistributedMuonLKindwise,
+    diag_inputs: Tensor,
+    diag_targets: Tensor,
+    train_batch_tokens: int,
+    diag_grad_microbatch_size: int,
+    lr_current: float,
+    diag_index: int,
+    step: int,
+    train_loss: float,
+    scheme: str,
+    seed: int,
+    ns_steps: int,
+    ggn_microbatch_size: int,
+    max_blocks: int,
+    l_estimator: str,
+    curvature_cache: dict[str, dict],
+    l_init_power_iters: int,
+    l_refresh_diag_interval: int,
+    l_refresh_power_iters: int,
+    l_blocks_per_diag: int,
+    l_floor: float,
+    eps_w: float,
+) -> dict:
+    """
+    Compute one OrScale diagnostic record at the current checkpoint.
+    Returns a dict ready for JSON serialization.
+    Called every DIAG_FREQ steps, before the optimizer step.
+    """
+    world_size = dist.get_world_size()
+    num_tokens_diag = diag_inputs.numel() * world_size  # global diagnostic tokens
+    momentum_debug_scale = 1.0 / train_batch_tokens
+
+    # ------------------------------------------------------------------ #
+    # 1. Collect exactly the MuonL matrix blocks, excluding AdamW fallback #
+    # ------------------------------------------------------------------ #
+    block_params = []  # list of (p, name, kind, block_idx, base_lr, raw_wd)
+    group_cfg_by_pid = {}
+    for group in optimizer2.param_groups:
+        base_lr = float(group.get("initial_lr", group["lr"]))
+        raw_wd = float(group["weight_decay"])
+        beta = float(group["momentum"])
+        nesterov = bool(group["nesterov"])
+        for p in group["params"]:
+            if p.ndim < 2:
+                continue
+            state = optimizer2.state[p]
+            if "momentum_buffer" not in state:
+                continue
+            name = optimizer2._param_name_by_id.get(id(p), f"id_{id(p)}")
+            kind = optimizer2._matrix_kind(p)
+            block_idx = optimizer2._param_block_by_id.get(id(p), -1)
+            block_params.append((p, name, kind, block_idx, base_lr, raw_wd))
+            group_cfg_by_pid[id(p)] = {"momentum": beta, "nesterov": nesterov}
+    block_params.sort(key=lambda item: (item[2], item[3], item[1]))
+    if max_blocks > 0:
+        block_params = block_params[:max_blocks]
+
+    def compute_diag_gradient() -> tuple[float, float, dict[int, Tensor], dict[int, list[Tensor]]]:
+        """Return diagnostic gradients plus per-microbatch block gradients."""
+        saved_grads = [(p, None if p.grad is None else p.grad.detach().clone())
+                       for p in model.parameters()]
+        loss_sum_global = torch.zeros((), device=diag_inputs.device, dtype=torch.float32)
+        chunk_size = max(1, int(diag_grad_microbatch_size))
+        g_diag_accum: dict[int, Tensor] = {}
+        microbatch_grads_cpu: dict[int, list[Tensor]] = {id(p): [] for p, *_ in block_params}
+
+        for start in range(0, diag_inputs.size(0), chunk_size):
+            model.zero_grad(set_to_none=True)
+            inputs_chunk = diag_inputs[start:start + chunk_size]
+            targets_chunk = diag_targets[start:start + chunk_size]
+            loss_sum_local = model(inputs_chunk, targets_chunk)
+            loss_sum_global.add_(loss_sum_local.detach().float())
+            chunk_tokens_global = inputs_chunk.numel() * world_size
+            chunk_weight = float(chunk_tokens_global) / float(max(num_tokens_diag, 1))
+            (loss_sum_local / float(max(chunk_tokens_global, 1))).backward()
+
+            for p, *_ in block_params:
+                if p.grad is None:
+                    raise RuntimeError(f"missing diagnostic gradient for {optimizer2._param_name_by_id.get(id(p), id(p))}")
+                dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                g_chunk = p.grad.detach().float().clone()
+                pid = id(p)
+                if pid not in g_diag_accum:
+                    g_diag_accum[pid] = g_chunk.mul(chunk_weight)
+                else:
+                    g_diag_accum[pid].add_(g_chunk, alpha=chunk_weight)
+                if l_estimator == "microbatch_fisher_gram":
+                    microbatch_grads_cpu[pid].append(g_chunk.reshape(-1).cpu())
+
+        dist.all_reduce(loss_sum_global, op=dist.ReduceOp.SUM)
+
+        g_diag: dict[int, Tensor] = {}
+        for p, *_ in block_params:
+            g_diag[id(p)] = g_diag_accum[id(p)]
+
+        model.zero_grad(set_to_none=True)
+        for p, g in saved_grads:
+            p.grad = g
+        f_sum = float(loss_sum_global)
+        return f_sum, f_sum / num_tokens_diag, g_diag, microbatch_grads_cpu
+
+    # ------------------------------------------------------------------ #
+    # 2. Diagnostic-batch gradient G_i and nuclear norm a_i               #
+    # ------------------------------------------------------------------ #
+    f_0_sum, f_0, g_diag, microbatch_grads_cpu = compute_diag_gradient()
+
+    # ------------------------------------------------------------------ #
+    # 3. Reconstruct original normalized-direction setup for r_i and x_i  #
+    # ------------------------------------------------------------------ #
+    block_info: dict[int, dict] = {}
+    for p, name, kind, block_idx, _lr, _wd in block_params:
+        state = optimizer2.state[p]
+        if p.grad is None:
+            raise RuntimeError(f"missing current training gradient for {name}")
+        beta = group_cfg_by_pid[id(p)]["momentum"]
+        nesterov = group_cfg_by_pid[id(p)]["nesterov"]
+        train_grad = p.grad.detach().float()
+        buf_old = state["momentum_buffer"].detach().float()
+        buf_next = torch.lerp(buf_old, train_grad, 1.0 - beta)
+        update_buffer = torch.lerp(train_grad, buf_next, beta) if nesterov else buf_next
+        vi_raw, shape_scale = _ns5_and_shape_scale(update_buffer, ns_steps)
+        vi_raw_norm = float(torch.linalg.vector_norm(vi_raw))
+        w = p.detach().float()
+        w_norm = float(torch.linalg.vector_norm(w))
+        m_i, n_i = int(_tensor_to_matrix(w).shape[0]), int(_tensor_to_matrix(w).shape[1])
+        d_i = min(m_i, n_i)
+        sqrt_d = math.sqrt(float(d_i))
+        r_i = vi_raw_norm / max(w_norm + eps_w, 1e-30)
+
+        g = g_diag[id(p)].float()
+        g_mat = _tensor_to_matrix(g)
+        a_i = float(torch.linalg.svdvals(g_mat).sum().item())
+        block_info[id(p)] = {
+            "param_name": name,
+            "type": kind,
+            "block_idx": block_idx,
+            "m_i": m_i,
+            "n_i": n_i,
+            "d_i": d_i,
+            "sqrt_d_i": sqrt_d,
+            "w_norm": w_norm,
+            "s_i": r_i * w_norm / max(sqrt_d, 1e-30),
+            "r_i": r_i,
+            "shape_scale": shape_scale,
+            "vi_raw_norm": vi_raw_norm,
+            "vi_source": "current_train_grad_nesterov_pre_ns",
+            "a_i": a_i,
+            "gi_frob_norm": float(torch.linalg.vector_norm(g).item()),
+            "base_lr": _lr,
+            "weight_decay_raw": _wd,
+        }
+
+    # ------------------------------------------------------------------ #
+    # 4. Compute rbar_C and rbar_all using the arithmetic mean rule       #
+    # ------------------------------------------------------------------ #
+    by_kind: dict[str, list] = {}
+    for p, name, kind, block_idx, _lr, _wd in block_params:
+        by_kind.setdefault(kind, []).append(id(p))
+
+    r_bar_C: dict[str, float] = {}
+    for kind, pids in by_kind.items():
+        r_bar_C[kind] = sum(block_info[pid]["r_i"] for pid in pids) / len(pids)
+
+    r_bar_all = (
+        sum(info["r_i"] for info in block_info.values()) / max(len(block_info), 1)
+    )
+
+    # ------------------------------------------------------------------ #
+    # 5. Get L_i from cache or warm-started blockwise GGN power iteration #
+    # ------------------------------------------------------------------ #
+    refresh_candidates: list[dict] = []
+    l_floor_events = []
+    curvature_refresh_count = 0
+    curvature_cache_hit_count = 0
+    curvature_pending_l_count = 0
+
+    if l_estimator == "microbatch_fisher_gram":
+        for p, name, kind, block_idx, _lr, _wd in block_params:
+            info = block_info[id(p)]
+            micro_grads = microbatch_grads_cpu.get(id(p), [])
+            if micro_grads:
+                stacked = torch.stack(micro_grads, dim=0).float()
+                gram = (stacked @ stacked.T) / float(len(micro_grads))
+                eigvals = torch.linalg.eigvalsh(gram)
+                l_raw = float(eigvals[-1].item())
+                gram_trace = float(torch.trace(gram).item())
+            else:
+                l_raw = None
+                gram_trace = None
+            l_floor_applied = (l_raw is None) or (not math.isfinite(l_raw)) or l_raw <= l_floor
+            l_i = max(l_raw if (l_raw is not None and math.isfinite(l_raw)) else l_floor, l_floor)
+            b_i = l_i * info["d_i"]
+            info.update({
+                "L_i": l_i,
+                "L_i_raw": l_raw if (l_raw is not None and math.isfinite(l_raw)) else None,
+                "L_i_floor_applied": bool(l_floor_applied),
+                "L_i_microbatch_count": len(micro_grads),
+                "L_i_gram_trace": gram_trace,
+                "power_last_hvp_norm": None,
+                "L_i_refresh": False,
+                "L_i_source": "microbatch_empirical_fisher_gram",
+                "L_i_age": 0,
+                "L_i_cache_diag_index": int(diag_index),
+                "L_i_power_iters_this_step": 0,
+                "power_vector_source": None,
+                "b_i": b_i,
+                "b_i_method": "microbatch_empirical_fisher_gram_lmax",
+            })
+            if l_floor_applied:
+                l_floor_events.append({
+                    "param_name": name,
+                    "L_i_raw": l_raw if (l_raw is not None and math.isfinite(l_raw)) else None,
+                    "L_i_floor": l_floor,
+                })
+
+    elif l_estimator == "rank1_fisher":
+        for p, name, kind, block_idx, _lr, _wd in block_params:
+            info = block_info[id(p)]
+            l_raw = info["gi_frob_norm"] ** 2
+            l_floor_applied = (not math.isfinite(l_raw)) or l_raw <= l_floor
+            l_i = max(l_raw if math.isfinite(l_raw) else l_floor, l_floor)
+            b_i = l_i * info["d_i"]
+            info.update({
+                "L_i": l_i,
+                "L_i_raw": l_raw if math.isfinite(l_raw) else None,
+                "L_i_floor_applied": bool(l_floor_applied),
+                "L_i_microbatch_count": None,
+                "L_i_gram_trace": None,
+                "power_last_hvp_norm": None,
+                "L_i_refresh": False,
+                "L_i_source": "rank1_batch_fisher_proxy",
+                "L_i_age": 0,
+                "L_i_cache_diag_index": int(diag_index),
+                "L_i_power_iters_this_step": 0,
+                "power_vector_source": None,
+                "b_i": b_i,
+                "b_i_method": "rank1_batch_fisher_proxy_g_frob_sq",
+            })
+            if l_floor_applied:
+                l_floor_events.append({
+                    "param_name": name,
+                    "L_i_raw": l_raw if math.isfinite(l_raw) else None,
+                    "L_i_floor": l_floor,
+                })
+
+    elif l_estimator != "ggn":
+        raise ValueError(f"unknown MYOPT_ORSCALE_L_ESTIMATOR={l_estimator!r}")
+
+    for block_ord, (p, name, kind, block_idx, _lr, _wd) in enumerate(block_params):
+        if l_estimator != "ggn":
+            continue
+        cache_entry = curvature_cache.get(name)
+        if cache_entry is None:
+            refresh_candidates.append({
+                "block_ord": block_ord,
+                "name": name,
+                "source": "init_power_iteration",
+                "age": None,
+                "power_iters": max(1, int(l_init_power_iters)),
+                "initial_vector": None,
+            })
+            continue
+
+        cached_at = int(cache_entry.get("diag_index", 0))
+        age = max(0, int(diag_index) - cached_at)
+        if int(l_refresh_diag_interval) > 0 and age >= int(l_refresh_diag_interval):
+            refresh_candidates.append({
+                "block_ord": block_ord,
+                "name": name,
+                "source": "warm_start_refresh",
+                "age": age,
+                "power_iters": max(1, int(l_refresh_power_iters)),
+                "initial_vector": cache_entry.get("power_vector_cpu"),
+            })
+
+    max_refresh = int(l_blocks_per_diag)
+    if max_refresh > 0:
+        refresh_selected_names = {
+            item["name"] for item in refresh_candidates[:max_refresh]
+        }
+    else:
+        refresh_selected_names = {item["name"] for item in refresh_candidates}
+    refresh_meta_by_name = {item["name"]: item for item in refresh_candidates}
+
+    for block_ord, (p, name, kind, block_idx, _lr, _wd) in enumerate(block_params):
+        if l_estimator != "ggn":
+            continue
+        cache_entry = curvature_cache.get(name)
+        refresh_meta = refresh_meta_by_name.get(name)
+        refresh_l_i = name in refresh_selected_names
+
+        if refresh_l_i:
+            l_i_source = refresh_meta["source"]
+            power_iters_this_step = int(refresh_meta["power_iters"])
+            l_i_age = refresh_meta["age"]
+            initial_vector = refresh_meta["initial_vector"]
+        elif cache_entry is None:
+            l_i_source = "pending_l_initialization"
+            power_iters_this_step = 0
+            l_i_age = None
+            initial_vector = None
+        else:
+            cached_at = int(cache_entry.get("diag_index", 0))
+            l_i_age = max(0, int(diag_index) - cached_at)
+            l_i_source = "cache_stale_pending_refresh" if refresh_meta is not None else "cache"
+            power_iters_this_step = 0
+            initial_vector = None
+
+        if refresh_l_i and dist.get_rank() == 0:
+            print0(
+                f"orscale_diag step:{step} block:{block_ord + 1}/{len(block_params)}"
+                f" {name} L_refresh:{l_i_source} iters:{power_iters_this_step}",
+                console=True,
+                log=False,
+            )
+
+        if refresh_l_i:
+            ggn_operator = _make_block_ggn_operator(
+                model=model,
+                diag_inputs=diag_inputs,
+                param_name=name,
+                num_tokens_diag=num_tokens_diag,
+                ggn_microbatch_size=ggn_microbatch_size,
+            )
+            l_info = _estimate_block_lmax(
+                ggn_operator=ggn_operator,
+                shape=p.shape,
+                device=p.device,
+                power_iters=power_iters_this_step,
+                seed=seed * 1_000_003 + step * 9_176 + block_ord,
+                floor=l_floor,
+                initial_vector=initial_vector,
+            )
+            curvature_cache[name] = {
+                "diag_index": int(diag_index),
+                "step": int(step),
+                "L_i": l_info["L_i"],
+                "L_i_raw": l_info["L_i_raw"],
+                "L_i_floor_applied": l_info["L_i_floor_applied"],
+                "L_i_microbatch_count": None,
+                "L_i_gram_trace": None,
+                "power_last_hvp_norm": l_info["power_last_hvp_norm"],
+                "power_vector_cpu": l_info["power_vector_cpu"],
+            }
+            curvature_refresh_count += 1
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        elif cache_entry is None:
+            l_info = {
+                "L_i": None,
+                "L_i_raw": None,
+                "L_i_floor_applied": False,
+                "power_last_hvp_norm": None,
+                "power_vector_source": None,
+            }
+            curvature_pending_l_count += 1
+        else:
+            l_info = {
+                "L_i": cache_entry["L_i"],
+                "L_i_raw": cache_entry.get("L_i_raw"),
+                "L_i_floor_applied": bool(cache_entry.get("L_i_floor_applied", False)),
+                "L_i_microbatch_count": None,
+                "L_i_gram_trace": None,
+                "power_last_hvp_norm": cache_entry.get("power_last_hvp_norm"),
+                "power_vector_source": "cached_not_used",
+            }
+            curvature_cache_hit_count += 1
+
+        info = block_info[id(p)]
+        b_i = l_info["L_i"] * info["d_i"] if l_info["L_i"] is not None else None
+        info.update({
+            "L_i": l_info["L_i"],
+            "L_i_raw": l_info["L_i_raw"],
+            "L_i_floor_applied": l_info["L_i_floor_applied"],
+            "power_last_hvp_norm": l_info["power_last_hvp_norm"],
+            "L_i_refresh": bool(refresh_l_i),
+            "L_i_source": l_i_source,
+            "L_i_age": l_i_age,
+            "L_i_cache_diag_index": (
+                int(diag_index) if refresh_l_i
+                else (int(cache_entry.get("diag_index", 0)) if cache_entry is not None else None)
+            ),
+            "L_i_power_iters_this_step": int(power_iters_this_step),
+            "power_vector_source": l_info.get("power_vector_source"),
+            "b_i": b_i,
+            "b_i_method": (
+                "block_ggn_power_iteration_jvp_vjp"
+                if b_i is not None else "pending_l_cache_not_used_in_phi"
+            ),
+        })
+        if refresh_l_i and l_info["L_i_floor_applied"]:
+            l_floor_events.append({
+                "param_name": name,
+                "L_i_raw": l_info["L_i_raw"],
+                "L_i_floor": l_floor,
+            })
+
+    # ------------------------------------------------------------------ #
+    # 6. Convert x_i to OrScale alpha_i and compute Phi/geometric stats   #
+    # ------------------------------------------------------------------ #
+    blocks_out = []
+    alpha_plain = []
+    alpha_typed = []
+    alpha_all = []
+    a_vals = []
+    b_vals = []
+    z_vals = []
+
+    for p, name, kind, block_idx, _lr, _wd in block_params:
+        pid = id(p)
+        info = block_info[pid]
+        sqrt_d = info["sqrt_d_i"]
+        w_norm = info["w_norm"]
+        r_i = info["r_i"]
+        rc = r_bar_C[kind]
+
+        a_plain = r_i * w_norm / max(sqrt_d, 1e-30)
+        a_typed = rc * w_norm / max(sqrt_d, 1e-30)
+        a_all = r_bar_all * w_norm / max(sqrt_d, 1e-30)
+        used_in_phi = info["b_i"] is not None
+        sqrt_b = math.sqrt(max(info["b_i"], 0.0)) if used_in_phi else None
+        z_i = info["a_i"] / max(sqrt_b, 1e-30) if used_in_phi else None
+
+        if used_in_phi:
+            alpha_plain.append(a_plain)
+            alpha_typed.append(a_typed)
+            alpha_all.append(a_all)
+            a_vals.append(info["a_i"])
+            b_vals.append(info["b_i"])
+            z_vals.append(z_i)
+
+        blocks_out.append({
+            "block_name": name,
+            "type": kind,
+            "block_idx": block_idx,
+            "used_in_phi": bool(used_in_phi),
+            "m_i": info["m_i"],
+            "n_i": info["n_i"],
+            "d_i": info["d_i"],
+            "w_norm": _safe_float(w_norm),
+            "s_i": _safe_float(info["s_i"]),
+            "r_i": _safe_float(r_i),
+            "rbar_C": _safe_float(rc),
+            "rbar_all": _safe_float(r_bar_all),
+            "alpha_i_plain": _safe_float(a_plain),
+            "alpha_i_typed": _safe_float(a_typed),
+            "alpha_i_all": _safe_float(a_all),
+            "a_i": _safe_float(info["a_i"]),
+            "a_i_definition": "nuclear_norm_of_diagnostic_gradient",
+            "L_i": _safe_float_or_none(info["L_i"]),
+            "L_i_raw": _safe_float_or_none(info["L_i_raw"]),
+            "L_i_floor_applied": bool(info["L_i_floor_applied"]),
+            "L_i_microbatch_count": info.get("L_i_microbatch_count"),
+            "L_i_gram_trace": _safe_float_or_none(info.get("L_i_gram_trace")),
+            "L_i_refresh": bool(info["L_i_refresh"]),
+            "L_i_source": info["L_i_source"],
+            "L_i_age": info["L_i_age"],
+            "L_i_cache_diag_index": (
+                int(info["L_i_cache_diag_index"])
+                if info["L_i_cache_diag_index"] is not None else None
+            ),
+            "L_i_power_iters_this_step": int(info["L_i_power_iters_this_step"]),
+            "power_vector_source": info["power_vector_source"],
+            "power_last_hvp_norm": _safe_float_or_none(info["power_last_hvp_norm"]),
+            "b_i": _safe_float_or_none(info["b_i"]),
+            "b_i_method": info["b_i_method"],
+            "y_i_plain": _safe_float_or_none(a_plain * sqrt_b if sqrt_b is not None else None),
+            "y_i_typed": _safe_float_or_none(a_typed * sqrt_b if sqrt_b is not None else None),
+            "y_i_all": _safe_float_or_none(a_all * sqrt_b if sqrt_b is not None else None),
+            "z_i": _safe_float_or_none(z_i),
+            "gradient_source": "diagnostic_gradient_per_token_loss",
+            "gi_frob_norm": _safe_float(info["gi_frob_norm"]),
+            "shape_scale": _safe_float(info["shape_scale"]),
+            "vi_raw_norm": _safe_float(info["vi_raw_norm"]),
+            "vi_source": info["vi_source"],
+            "base_lr": _safe_float(info["base_lr"]),
+            "weight_decay_raw": _safe_float(info["weight_decay_raw"]),
+            "weight_decay_included_in_phi": False,
+        })
+
+    plain_stats = _scheme_orscale_stats(
+        alpha=alpha_plain, a_vals=a_vals, b_vals=b_vals, z_vals=z_vals,
+    )
+    typed_stats = _scheme_orscale_stats(
+        alpha=alpha_typed, a_vals=a_vals, b_vals=b_vals, z_vals=z_vals,
+    )
+    all_stats = _scheme_orscale_stats(
+        alpha=alpha_all, a_vals=a_vals, b_vals=b_vals, z_vals=z_vals,
+    )
+
+    groups_data = {}
+    for kind, pids in by_kind.items():
+        phi_pids = [pid for pid in pids if block_info[pid].get("b_i") is not None]
+        groups_data[kind] = {
+            "rbar_C": _safe_float(r_bar_C[kind]),
+            "num_blocks": len(pids),
+            "phi_block_count": len(phi_pids),
+            "pending_l_blocks": len(pids) - len(phi_pids),
+            "sum_a_i": _safe_float(sum(block_info[pid]["a_i"] for pid in pids)),
+            "sum_b_i": _safe_float_or_none(
+                sum(block_info[pid]["b_i"] for pid in phi_pids)
+                if phi_pids else None
+            ),
+            "mean_r_i": _safe_float(sum(block_info[pid]["r_i"] for pid in pids) / len(pids)),
+            "block_names": [
+                block_info[pid]["param_name"]
+                for pid in sorted(pids, key=lambda pid: block_info[pid]["block_idx"])
+            ],
+        }
+
+    phi_plain = plain_stats["Phi"]
+    phi_typed = typed_stats["Phi"]
+    phi_all = all_stats["Phi"]
+    kappa_typed_plain = _safe_ratio(phi_typed, phi_plain) if phi_typed is not None and phi_plain is not None else None
+    kappa_all_plain = _safe_ratio(phi_all, phi_plain) if phi_all is not None and phi_plain is not None else None
+    kappa_typed_all = _safe_ratio(phi_typed, phi_all) if phi_typed is not None and phi_all is not None else None
+
+    return {
+        "diagnostic": "orscale_layer_adaptive_score",
+        "diag_index": int(diag_index),
+        "step": step,
+        "train_loss": _safe_float(train_loss),
+        "diag_loss": _safe_float(f_0),
+        "diag_loss_sum": _safe_float(f_0_sum),
+        "lr_current": _safe_float(lr_current),
+        "optimizer": scheme,
+        "seed": seed,
+        "gradient_source": "diagnostic_gradient_per_token_loss",
+        "loss_reduction": "per_token_mean",
+        "momentum_signal_scale": _safe_float(momentum_debug_scale),
+        "momentum_debug_scale": _safe_float(momentum_debug_scale),
+        "diag_grad_microbatch_size": int(diag_grad_microbatch_size),
+        "included_block_count": len(blocks_out),
+        "phi_block_count": len(a_vals),
+        "pending_l_block_count": int(curvature_pending_l_count),
+        "phi_scope": (
+            "full_initialized_l_cache"
+            if len(a_vals) == len(blocks_out) else
+            "initialized_l_cache_subset"
+        ),
+        "included_block_rule": (
+            "MuonL matrix blocks in optimizer2 only; AdamW fallback params excluded"
+            if max_blocks <= 0 else
+            f"debug subset: first {max_blocks} MuonL matrix blocks after deterministic ordering"
+        ),
+        "direction_normalization": {
+            "V_i": "Q_i / ||Q_i||_F",
+            "Q_i_OrScale": "sqrt(d_i) * V_i",
+            "alpha_i": "x_i * ||W_i||_F / sqrt(d_i)",
+        },
+        "curvature": {
+            "estimator": l_estimator,
+            "operator": (
+                "microbatch_empirical_fisher_gram_lmax"
+                if l_estimator == "microbatch_fisher_gram" else
+                "rank1_batch_fisher_proxy_g_frob_sq"
+                if l_estimator == "rank1_fisher"
+                else "block_generalized_gauss_newton_jvp_vjp"
+            ),
+            "cache_enabled": bool(l_estimator == "ggn"),
+            "init_power_iters": int(l_init_power_iters),
+            "refresh_diag_interval": int(l_refresh_diag_interval),
+            "refresh_power_iters": int(l_refresh_power_iters),
+            "max_blocks_refreshed_per_diag": int(l_blocks_per_diag),
+            "refresh_candidates_this_diag": len(refresh_candidates),
+            "refreshed_blocks_this_diag": int(curvature_refresh_count),
+            "cached_blocks_this_diag": int(curvature_cache_hit_count),
+            "pending_l_blocks_this_diag": int(curvature_pending_l_count),
+            "microbatch_size": int(ggn_microbatch_size),
+            "L_i_floor": _safe_float(l_floor),
+            "floor_events": l_floor_events,
+        },
+        "weight_decay_handling": "decoupled weight decay is omitted from OrScale Phi",
+        "rbar_all": _safe_float(r_bar_all),
+        "Phi_plain": phi_plain,
+        "Phi_typed": phi_typed,
+        "Phi_all": phi_all,
+        "kappa_typed_plain": _safe_float(kappa_typed_plain) if kappa_typed_plain is not None else None,
+        "kappa_all_plain": _safe_float(kappa_all_plain) if kappa_all_plain is not None else None,
+        "kappa_typed_all": _safe_float(kappa_typed_all) if kappa_typed_all is not None else None,
+        "cos2_plain": plain_stats["cos2"],
+        "cos2_typed": typed_stats["cos2"],
+        "cos2_all": all_stats["cos2"],
+        "nu_plain": plain_stats["nu"],
+        "nu_typed": typed_stats["nu"],
+        "nu_all": all_stats["nu"],
+        "rho_plain": plain_stats["rho"],
+        "rho_typed": typed_stats["rho"],
+        "rho_all": all_stats["rho"],
+        "plain": plain_stats,
+        "typed": typed_stats,
+        "all": all_stats,
+        "ordering": {
+            "typed_gt_plain": bool(phi_typed is not None and phi_plain is not None and phi_typed > phi_plain),
+            "plain_gt_all": bool(phi_plain is not None and phi_all is not None and phi_plain > phi_all),
+            "typed_gt_all": bool(phi_typed is not None and phi_all is not None and phi_typed > phi_all),
+            "target_typed_gt_plain_gt_all": bool(
+                phi_typed is not None and phi_plain is not None and phi_all is not None
+                and phi_typed > phi_plain > phi_all
+            ),
+        },
+        "groups": groups_data,
+        "blocks": blocks_out,
+    }
+
+
+def compute_local_quadratic_diagnostics(
+    model: GPT,
+    optimizer2: DistributedMuonLKindwise,
+    diag_inputs: Tensor,
+    diag_targets: Tensor,
+    diag_data_source: str,
+    train_batch_tokens: int,
+    diag_grad_microbatch_size: int,
+    hvp_microbatch_size: int,
+    lr_current: float,
+    diag_index: int,
+    step: int,
+    train_loss: float,
+    scheme: str,
+    seed: int,
+    ns_steps: int,
+    max_blocks: int,
+    curvature_method: str,
+    fd_probes: int,
+    fd_rel_eps: float,
+    fd_abs_eps: float,
+    eps_w: float,
+    eps_den: float,
+    exact_hvp_eager_diagnostic_model: bool,
+    measure_cross_curvature: bool,
+    save_cross_curvature_matrix: bool,
+) -> dict:
+    """
+    Measure how well three scalar choices x_i match
+
+        t_i = <G_i, V_i> / (||W_i||_F * <V_i, H_ii V_i>)
+
+    for the basic Muon shape-scaled update
+
+        -eta * r_i * ||W_i||_F * V_i.
+
+    Called every DIAG_FREQ steps, before optimizer.step().
+    """
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+        cuda_allocated_start = int(torch.cuda.memory_allocated())
+        cuda_reserved_start = int(torch.cuda.memory_reserved())
+    else:
+        cuda_allocated_start = None
+        cuda_reserved_start = None
+
+    world_size = dist.get_world_size()
+    num_tokens_diag = diag_inputs.numel() * world_size
+    momentum_debug_scale = 1.0 / train_batch_tokens
+
+    block_params = []
+    group_cfg_by_pid = {}
+    for group in optimizer2.param_groups:
+        base_lr = float(group.get("initial_lr", group["lr"]))
+        raw_wd = float(group["weight_decay"])
+        beta = float(group["momentum"])
+        nesterov = bool(group["nesterov"])
+        for p in group["params"]:
+            if p.ndim < 2:
+                continue
+            state = optimizer2.state[p]
+            if "momentum_buffer" not in state:
+                continue
+            name = optimizer2._param_name_by_id.get(id(p), f"id_{id(p)}")
+            kind = optimizer2._matrix_kind(p)
+            block_idx = optimizer2._param_block_by_id.get(id(p), -1)
+            block_params.append((p, name, kind, block_idx, base_lr, raw_wd))
+            group_cfg_by_pid[id(p)] = {"momentum": beta, "nesterov": nesterov}
+    block_params.sort(key=lambda item: (item[3], item[1]))
+    if max_blocks > 0:
+        block_params = block_params[:max_blocks]
+
+    def compute_diag_gradient() -> tuple[float, float, dict[int, Tensor]]:
+        saved_grads = [(p, None if p.grad is None else p.grad.detach().clone())
+                       for p in model.parameters()]
+        loss_sum_global = torch.zeros((), device=diag_inputs.device, dtype=torch.float32)
+        chunk_size = max(1, int(diag_grad_microbatch_size))
+        g_diag_accum: dict[int, Tensor] = {}
+
+        for start in range(0, diag_inputs.size(0), chunk_size):
+            model.zero_grad(set_to_none=True)
+            inputs_chunk = diag_inputs[start:start + chunk_size]
+            targets_chunk = diag_targets[start:start + chunk_size]
+            loss_sum_local = model(inputs_chunk, targets_chunk)
+            loss_sum_global.add_(loss_sum_local.detach().float())
+            chunk_tokens_global = inputs_chunk.numel() * world_size
+            chunk_weight = float(chunk_tokens_global) / float(max(num_tokens_diag, 1))
+            (loss_sum_local / float(max(chunk_tokens_global, 1))).backward()
+
+            for p, *_ in block_params:
+                if p.grad is None:
+                    raise RuntimeError(f"missing diagnostic gradient for {optimizer2._param_name_by_id.get(id(p), id(p))}")
+                dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                g_chunk = p.grad.detach().float().clone()
+                pid = id(p)
+                if pid not in g_diag_accum:
+                    g_diag_accum[pid] = g_chunk.mul(chunk_weight)
+                else:
+                    g_diag_accum[pid].add_(g_chunk, alpha=chunk_weight)
+
+        dist.all_reduce(loss_sum_global, op=dist.ReduceOp.SUM)
+
+        g_diag: dict[int, Tensor] = {}
+        for p, *_ in block_params:
+            g_diag[id(p)] = g_diag_accum[id(p)]
+
+        model.zero_grad(set_to_none=True)
+        for p, g in saved_grads:
+            p.grad = g
+        f_sum = float(loss_sum_global)
+        return f_sum, f_sum / num_tokens_diag, g_diag
+
+    def compute_diag_loss_only() -> tuple[float, float]:
+        loss_sum_global = torch.zeros((), device=diag_inputs.device, dtype=torch.float32)
+        chunk_size = max(1, int(hvp_microbatch_size))
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for start in range(0, diag_inputs.size(0), chunk_size):
+                inputs_chunk = diag_inputs[start:start + chunk_size]
+                targets_chunk = diag_targets[start:start + chunk_size]
+                loss_sum_local = model(inputs_chunk, targets_chunk)
+                loss_sum_global.add_(loss_sum_local.detach().float())
+        if was_training:
+            model.train()
+        dist.all_reduce(loss_sum_global, op=dist.ReduceOp.SUM)
+        f_sum = float(loss_sum_global)
+        return f_sum, f_sum / num_tokens_diag
+
+    f_0_sum, f_0, g_diag = compute_diag_gradient()
+
+    block_info: dict[int, dict] = {}
+    by_kind: dict[str, list[int]] = {}
+    for block_ord, (p, name, kind, block_idx, _lr, _wd) in enumerate(block_params):
+        state = optimizer2.state[p]
+        if p.grad is None:
+            raise RuntimeError(f"missing current training gradient for {name}")
+
+        beta = group_cfg_by_pid[id(p)]["momentum"]
+        nesterov = group_cfg_by_pid[id(p)]["nesterov"]
+        train_grad = p.grad.detach().float()
+        buf_old = state["momentum_buffer"].detach().float()
+        buf_next = torch.lerp(buf_old, train_grad, 1.0 - beta)
+        update_buffer = torch.lerp(train_grad, buf_next, beta) if nesterov else buf_next
+        vi_raw, shape_scale = _ns5_and_shape_scale(update_buffer, ns_steps)
+        vi_raw = vi_raw.float()
+        vi_raw_norm = float(torch.linalg.vector_norm(vi_raw).item())
+        if vi_raw_norm <= eps_den or not math.isfinite(vi_raw_norm):
+            v_i = torch.zeros_like(vi_raw, dtype=torch.float32)
+        else:
+            v_i = vi_raw / vi_raw_norm
+
+        w = p.detach().float()
+        w_norm = float(torch.linalg.vector_norm(w).item())
+        m_i, n_i = int(_tensor_to_matrix(w).shape[0]), int(_tensor_to_matrix(w).shape[1])
+        d_i = min(m_i, n_i)
+        r_i = vi_raw_norm / max(w_norm + eps_w, 1e-30)
+
+        g_i = g_diag[id(p)].float()
+        g_dot_v = float(torch.sum(g_i * v_i).item())
+        fd_epsilon = max(float(fd_abs_eps), float(fd_rel_eps) * max(w_norm, 1.0))
+
+        block_info[id(p)] = {
+            "param_name": name,
+            "type": kind,
+            "block_idx": block_idx,
+            "m_i": m_i,
+            "n_i": n_i,
+            "d_i": d_i,
+            "w_norm": w_norm,
+            "r_i": r_i,
+            "shape_scale": shape_scale,
+            "vi_raw_norm": vi_raw_norm,
+            "vi_unit_norm": float(torch.linalg.vector_norm(v_i).item()),
+            "train_grad_frob_norm": float(torch.linalg.vector_norm(train_grad).item()),
+            "diag_g_frob_norm": float(torch.linalg.vector_norm(g_i).item()),
+            "g_dot_v": g_dot_v,
+            "v_i_tensor": v_i,
+            "fd_epsilon": fd_epsilon,
+            "base_lr": _lr,
+            "weight_decay_raw": _wd,
+        }
+        by_kind.setdefault(kind, []).append(id(p))
+
+    fd_probe_losses = []
+
+    cross_curvature_matrix = None
+    cross_curvature_order = None
+    if measure_cross_curvature and curvature_method != "exact_hvp":
+        raise ValueError("cross curvature measurement currently requires MYOPT_LOCAL_QUADRATIC_CURVATURE=exact_hvp")
+
+    if curvature_method == "exact_hvp" and measure_cross_curvature:
+        n_blocks = len(block_params)
+        target_params = [p for p, *_ in block_params]
+        cross_curvature_matrix = [
+            [float("nan") for _ in range(n_blocks)]
+            for _ in range(n_blocks)
+        ]
+        cross_curvature_order = [
+            {
+                "block_name": name,
+                "type": kind,
+                "block_idx": int(block_idx),
+            }
+            for p, name, kind, block_idx, _lr, _wd in block_params
+        ]
+        for source_ord, (source_p, source_name, _source_kind, _source_block_idx, _lr, _wd) in enumerate(block_params):
+            source_info = block_info[id(source_p)]
+            source_v = source_info["v_i_tensor"]
+            if dist.get_rank() == 0 and n_blocks > 8 and source_ord % 12 == 0:
+                print0(
+                    f"local_quadratic_diag step:{step} cross_hvp_source:{source_ord + 1}/{n_blocks} {source_name}",
+                    console=True,
+                    log=False,
+                )
+            hv_by_pid = _exact_source_block_hessian_vecs(
+                model=model,
+                diag_inputs=diag_inputs,
+                diag_targets=diag_targets,
+                source_param=source_p,
+                source_vector=source_v,
+                target_params=target_params,
+                num_tokens_diag=num_tokens_diag,
+                hvp_microbatch_size=hvp_microbatch_size,
+            )
+            for target_ord, (target_p, *_target_rest) in enumerate(block_params):
+                target_info = block_info[id(target_p)]
+                hv_target = hv_by_pid[id(target_p)]
+                cij = float(torch.sum(target_info["v_i_tensor"] * hv_target).item())
+                cross_curvature_matrix[target_ord][source_ord] = cij
+                if target_ord == source_ord:
+                    target_info.update({
+                        "curvature_method": "exact_hvp",
+                        "hvp_frob_norm": float(torch.linalg.vector_norm(hv_target).item()),
+                        "v_h_v": cij,
+                        "v_h_v_raw_values": [cij],
+                        "v_h_v_std": None,
+                    })
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        for target_ord, (target_p, *_target_rest) in enumerate(block_params):
+            target_info = block_info[id(target_p)]
+            wi = target_info["w_norm"]
+            mi = float(target_info["m_i"])
+            kind_i = target_info["type"]
+            shape_wi = wi / math.sqrt(max(mi, 1e-30))
+            typed_cross_sum = 0.0
+            all_cross_sum = 0.0
+            for source_ord, (source_p, *_source_rest) in enumerate(block_params):
+                if source_ord == target_ord:
+                    continue
+                source_info = block_info[id(source_p)]
+                wj = source_info["w_norm"]
+                mj = float(source_info["m_i"])
+                cij = cross_curvature_matrix[target_ord][source_ord]
+                if source_info["type"] == kind_i:
+                    typed_den = wi + wj
+                    if abs(typed_den) > eps_den:
+                        typed_cross_sum += (2.0 * wj / typed_den) * cij
+                shape_wj = wj / math.sqrt(max(mj, 1e-30))
+                all_den = shape_wi + shape_wj
+                if abs(all_den) > eps_den:
+                    all_cross_sum += (
+                        2.0
+                        * math.sqrt(max(mj / max(mi, 1e-30), 0.0))
+                        * shape_wj
+                        / all_den
+                    ) * cij
+            self_curv = target_info["v_h_v"]
+            target_info["cross_curvature_typed_sum"] = typed_cross_sum
+            target_info["cross_curvature_all_sum"] = all_cross_sum
+            target_info["weighted_adjusted_curvature_typed"] = self_curv + typed_cross_sum
+            target_info["weighted_adjusted_curvature_all"] = self_curv + all_cross_sum
+
+    elif curvature_method == "exact_hvp":
+        for block_ord, (p, name, kind, block_idx, _lr, _wd) in enumerate(block_params):
+            info = block_info[id(p)]
+            v_i = info["v_i_tensor"]
+            if dist.get_rank() == 0 and len(block_params) > 8 and block_ord % 12 == 0:
+                print0(
+                    f"local_quadratic_diag step:{step} hvp_block:{block_ord + 1}/{len(block_params)} {name}",
+                    console=True,
+                    log=False,
+                )
+            h_v = _exact_block_hessian_vec(
+                model=model,
+                diag_inputs=diag_inputs,
+                diag_targets=diag_targets,
+                param=p,
+                vector=v_i,
+                num_tokens_diag=num_tokens_diag,
+                hvp_microbatch_size=hvp_microbatch_size,
+            )
+            v_h_v = float(torch.sum(v_i * h_v).item())
+            info.update({
+                "curvature_method": "exact_hvp",
+                "hvp_frob_norm": float(torch.linalg.vector_norm(h_v).item()),
+                "v_h_v": v_h_v,
+                "v_h_v_raw_values": [v_h_v],
+                "v_h_v_std": None,
+            })
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    elif curvature_method == "block_loss_fd":
+        for block_ord, (p, name, kind, block_idx, _lr, _wd) in enumerate(block_params):
+            info = block_info[id(p)]
+            v_i = info["v_i_tensor"].to(device=p.device, dtype=p.dtype)
+            eps_i = float(info["fd_epsilon"])
+            if dist.get_rank() == 0 and len(block_params) > 8 and block_ord % 12 == 0:
+                print0(
+                    f"local_quadratic_diag step:{step} loss_fd_block:{block_ord + 1}/{len(block_params)} {name}",
+                    console=True,
+                    log=False,
+                )
+            with torch.no_grad():
+                p.add_(v_i, alpha=eps_i)
+            f_plus_sum, f_plus = compute_diag_loss_only()
+            with torch.no_grad():
+                p.add_(v_i, alpha=-2.0 * eps_i)
+            f_minus_sum, f_minus = compute_diag_loss_only()
+            with torch.no_grad():
+                p.add_(v_i, alpha=eps_i)
+
+            v_h_v = (f_plus - 2.0 * f_0 + f_minus) / max(eps_i * eps_i, 1e-30)
+            info.update({
+                "curvature_method": "block_loss_fd",
+                "hvp_frob_norm": None,
+                "v_h_v": v_h_v,
+                "v_h_v_raw_values": [v_h_v],
+                "v_h_v_std": None,
+                "fd_loss_base": f_0,
+                "fd_loss_base_sum": f_0_sum,
+                "fd_loss_plus": f_plus,
+                "fd_loss_minus": f_minus,
+                "fd_loss_plus_sum": f_plus_sum,
+                "fd_loss_minus_sum": f_minus_sum,
+            })
+
+    elif curvature_method == "random_grad_fd":
+        probe_count = max(1, int(fd_probes))
+        curv_values: dict[int, list[float]] = {id(p): [] for p, *_ in block_params}
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(int(seed * 1_000_003 + step * 9_176 + diag_index * 101))
+
+        def apply_probe(signs: list[float], scale: float) -> None:
+            with torch.no_grad():
+                for sign, (p, *_rest) in zip(signs, block_params):
+                    info = block_info[id(p)]
+                    eps_i = info["fd_epsilon"]
+                    v_i = info["v_i_tensor"].to(device=p.device, dtype=p.dtype)
+                    p.add_(v_i, alpha=float(scale) * float(sign) * float(eps_i))
+
+        for probe_idx in range(probe_count):
+            signs_tensor = torch.randint(
+                0, 2, (len(block_params),), generator=gen, dtype=torch.int8
+            )
+            signs = [1.0 if int(v) else -1.0 for v in signs_tensor.tolist()]
+            apply_probe(signs, +1.0)
+            f_plus_sum, f_plus, g_plus = compute_diag_gradient()
+            apply_probe(signs, -2.0)
+            f_minus_sum, f_minus, g_minus = compute_diag_gradient()
+            apply_probe(signs, +1.0)
+            fd_probe_losses.append({
+                "probe_index": int(probe_idx),
+                "loss_plus": _safe_float(f_plus),
+                "loss_minus": _safe_float(f_minus),
+                "loss_plus_sum": _safe_float(f_plus_sum),
+                "loss_minus_sum": _safe_float(f_minus_sum),
+            })
+
+            for sign, (p, *_rest) in zip(signs, block_params):
+                info = block_info[id(p)]
+                pid = id(p)
+                eps_i = info["fd_epsilon"]
+                v_i = info["v_i_tensor"]
+                grad_diff = g_plus[pid].float() - g_minus[pid].float()
+                dot_diff = float(torch.sum(v_i * grad_diff).item())
+                h_hat = float(sign) * dot_diff / max(2.0 * eps_i, 1e-30)
+                curv_values[pid].append(h_hat)
+
+        for p, name, kind, block_idx, _lr, _wd in block_params:
+            info = block_info[id(p)]
+            vals = curv_values[id(p)]
+            mean_vhv = sum(vals) / len(vals) if vals else None
+            std_vhv = (
+                math.sqrt(sum((v - mean_vhv) ** 2 for v in vals) / len(vals))
+                if vals and mean_vhv is not None else None
+            )
+            info.update({
+                "curvature_method": "random_grad_fd",
+                "hvp_frob_norm": None,
+                "v_h_v": mean_vhv,
+                "v_h_v_raw_values": vals,
+                "v_h_v_std": std_vhv,
+            })
+
+    else:
+        raise ValueError(f"unknown local_quadratic curvature method {curvature_method!r}")
+
+    if curvature_method == "exact_hvp":
+        nonzero_hvp_blocks = sum(
+            1
+            for info in block_info.values()
+            if (info.get("hvp_frob_norm") is not None and info["hvp_frob_norm"] > eps_den)
+        )
+        if block_info and nonzero_hvp_blocks == 0:
+            raise RuntimeError(
+                "exact_hvp produced zero HVP for every measured block; "
+                "this indicates a broken second-order graph, often from a compiled model path."
+            )
+
+    for p, *_rest in block_params:
+        info = block_info[id(p)]
+        v_h_v = info["v_h_v"]
+        denominator = info["w_norm"] * v_h_v if v_h_v is not None else None
+        valid_t = (
+            v_h_v is not None
+            and math.isfinite(info["g_dot_v"])
+            and math.isfinite(denominator)
+            and abs(denominator) > eps_den
+        )
+        info["denominator_w_norm_v_h_v"] = denominator
+        info["t_i"] = info["g_dot_v"] / denominator if valid_t else None
+        info["t_i_valid"] = bool(valid_t)
+
+    r_bar_C: dict[str, float] = {}
+    for kind, pids in by_kind.items():
+        r_bar_C[kind] = sum(block_info[pid]["r_i"] for pid in pids) / len(pids)
+
+    r_bar_all = (
+        sum(info["r_i"] for info in block_info.values()) / max(len(block_info), 1)
+    )
+
+    blocks_out = []
+    t_vals = []
+    x_plain = []
+    x_typed = []
+    x_all = []
+
+    for p, name, kind, block_idx, _lr, _wd in block_params:
+        info = block_info[id(p)]
+        rc = r_bar_C[kind]
+        ra = r_bar_all
+        ti = info["t_i"]
+        if ti is not None:
+            t_vals.append(ti)
+            x_plain.append(info["r_i"])
+            x_typed.append(rc)
+            x_all.append(ra)
+
+        blocks_out.append({
+            "block_name": name,
+            "type": kind,
+            "block_idx": block_idx,
+            "m_i": info["m_i"],
+            "n_i": info["n_i"],
+            "d_i": info["d_i"],
+            "w_norm": _safe_float(info["w_norm"]),
+            "r_i": _safe_float(info["r_i"]),
+            "rbar_C": _safe_float(rc),
+            "rbar_all": _safe_float(ra),
+            "x_plain": _safe_float(info["r_i"]),
+            "x_typed": _safe_float(rc),
+            "x_all": _safe_float(ra),
+            "t_i": _safe_float_or_none(ti),
+            "t_i_valid": bool(info["t_i_valid"]),
+            "g_dot_v": _safe_float(info["g_dot_v"]),
+            "v_h_v": _safe_float_or_none(info["v_h_v"]),
+            "cross_curvature_typed_sum": _safe_float_or_none(info.get("cross_curvature_typed_sum")),
+            "cross_curvature_all_sum": _safe_float_or_none(info.get("cross_curvature_all_sum")),
+            "weighted_adjusted_curvature_typed": _safe_float_or_none(
+                info.get("weighted_adjusted_curvature_typed")
+            ),
+            "weighted_adjusted_curvature_all": _safe_float_or_none(
+                info.get("weighted_adjusted_curvature_all")
+            ),
+            "v_h_v_raw_values": [
+                _safe_float(v) for v in info.get("v_h_v_raw_values", [])
+                if math.isfinite(float(v))
+            ],
+            "v_h_v_std": _safe_float_or_none(info.get("v_h_v_std")),
+            "denominator_w_norm_v_h_v": _safe_float_or_none(info["denominator_w_norm_v_h_v"]),
+            "hvp_frob_norm": _safe_float_or_none(info["hvp_frob_norm"]),
+            "curvature_method": info["curvature_method"],
+            "fd_epsilon": _safe_float(info["fd_epsilon"]),
+            "fd_loss_base": _safe_float_or_none(info.get("fd_loss_base")),
+            "fd_loss_plus": _safe_float_or_none(info.get("fd_loss_plus")),
+            "fd_loss_minus": _safe_float_or_none(info.get("fd_loss_minus")),
+            "fd_loss_base_sum": _safe_float_or_none(info.get("fd_loss_base_sum")),
+            "fd_loss_plus_sum": _safe_float_or_none(info.get("fd_loss_plus_sum")),
+            "fd_loss_minus_sum": _safe_float_or_none(info.get("fd_loss_minus_sum")),
+            "diag_g_frob_norm": _safe_float(info["diag_g_frob_norm"]),
+            "train_grad_frob_norm": _safe_float(info["train_grad_frob_norm"]),
+            "shape_scale": _safe_float(info["shape_scale"]),
+            "vi_raw_norm": _safe_float(info["vi_raw_norm"]),
+            "vi_unit_norm": _safe_float(info["vi_unit_norm"]),
+            "base_lr": _safe_float(info["base_lr"]),
+            "lr_current": _safe_float(lr_current),
+            "weight_decay_raw": _safe_float(info["weight_decay_raw"]),
+            "weight_decay_included_in_direction": False,
+        })
+
+    plain_stats = _vector_match_stats(x_plain, t_vals)
+    typed_stats = _vector_match_stats(x_typed, t_vals)
+    all_stats = _vector_match_stats(x_all, t_vals)
+
+    groups_data = {}
+    for kind, pids in by_kind.items():
+        valid_pids = [pid for pid in pids if block_info[pid]["t_i"] is not None]
+        groups_data[kind] = {
+            "rbar_C": _safe_float(r_bar_C[kind]),
+            "num_blocks": len(pids),
+            "valid_t_block_count": len(valid_pids),
+            "mean_r_i": _safe_float(sum(block_info[pid]["r_i"] for pid in pids) / len(pids)),
+            "mean_t_i_valid_only": _safe_float_or_none(
+                sum(block_info[pid]["t_i"] for pid in valid_pids) / len(valid_pids)
+                if valid_pids else None
+            ),
+            "block_names": [
+                block_info[pid]["param_name"]
+                for pid in sorted(pids, key=lambda pid: block_info[pid]["block_idx"])
+            ],
+        }
+
+    return {
+        "diagnostic": "muon_shape_scaled_t_scalar_match",
+        "diag_index": int(diag_index),
+        "step": step,
+        "train_loss": _safe_float(train_loss),
+        "diag_loss": _safe_float(f_0),
+        "diag_loss_sum": _safe_float(f_0_sum),
+        "lr_current": _safe_float(lr_current),
+        "optimizer": scheme,
+        "seed": seed,
+        "diag_data_source": diag_data_source,
+        "diag_sequence_count_local": int(diag_inputs.size(0)),
+        "diag_token_count_global": int(num_tokens_diag),
+        "gradient_source": "diagnostic_gradient_per_token_loss",
+        "loss_reduction": "per_token_mean",
+        "direction_source": "basic_muon_shape_scaled_current_train_direction",
+        "direction_formula": "-eta * r_i * ||W_i||_F * V_i",
+        "target_scalar_formula": "<G_i,V_i> / (||W_i||_F * <V_i,H_ii V_i>)",
+        "hvp": {
+            "operator": (
+                "exact_block_hessian_of_diagnostic_per_token_loss"
+                if curvature_method == "exact_hvp"
+                else "blockwise_central_finite_difference_of_diagnostic_loss"
+                if curvature_method == "block_loss_fd"
+                else "random_sign_central_finite_difference_of_diagnostic_gradient"
+            ),
+            "microbatch_size": int(hvp_microbatch_size),
+            "sdpa_backend": "math" if curvature_method == "exact_hvp" else "default",
+            "second_order_quantity": "<V_i,H_ii V_i>",
+            "curvature_method": curvature_method,
+            "cross_curvature_enabled": bool(measure_cross_curvature),
+            "cross_curvature_quantity": "C_ij = <V_i, H_ij V_j>",
+            "weighted_adjusted_curvature_definitions": {
+                "typed": (
+                    "tilde_L_i = C_ii + sum_{j same type, j!=i} "
+                    "2||W_j||_F/(||W_i||_F+||W_j||_F) C_ij"
+                ),
+                "all": (
+                    "tilde_L_i = C_ii + sum_{j!=i} "
+                    "2 sqrt(m_j/m_i) (||W_j||_F/sqrt(m_j)) / "
+                    "((||W_i||_F/sqrt(m_i))+(||W_j||_F/sqrt(m_j))) C_ij"
+                ),
+            },
+            "fd_probe_count": int(fd_probes) if curvature_method == "random_grad_fd" else 0,
+            "fd_rel_eps": _safe_float(fd_rel_eps),
+            "fd_abs_eps": _safe_float(fd_abs_eps),
+            "fd_probe_losses": fd_probe_losses,
+            "exact_hvp_eager_diagnostic_model": bool(exact_hvp_eager_diagnostic_model),
+        },
+        "cuda_memory": {
+            "allocated_start_bytes": cuda_allocated_start,
+            "reserved_start_bytes": cuda_reserved_start,
+            "allocated_peak_bytes": int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else None,
+            "reserved_peak_bytes": int(torch.cuda.max_memory_reserved()) if torch.cuda.is_available() else None,
+            "allocated_peak_gb": (
+                _safe_float(torch.cuda.max_memory_allocated() / 1024**3)
+                if torch.cuda.is_available() else None
+            ),
+            "reserved_peak_gb": (
+                _safe_float(torch.cuda.max_memory_reserved() / 1024**3)
+                if torch.cuda.is_available() else None
+            ),
+        },
+        "x_definitions": {
+            "plain": "x_i = r_i",
+            "all": "x_i = arithmetic_mean_all_blocks(r_i)",
+            "typed": "x_i = arithmetic_mean_same_type(r_i)",
+        },
+        "momentum_signal_scale": _safe_float(momentum_debug_scale),
+        "momentum_debug_scale": _safe_float(momentum_debug_scale),
+        "diag_grad_microbatch_size": int(diag_grad_microbatch_size),
+        "included_block_count": len(blocks_out),
+        "valid_t_block_count": len(t_vals),
+        "included_block_rule": (
+            "basic Muon matrix blocks in optimizer2 only; AdamW fallback params excluded"
+            if max_blocks <= 0 else
+            f"debug subset: first {max_blocks} basic Muon matrix blocks after deterministic ordering"
+        ),
+        "rbar_all": _safe_float(r_bar_all),
+        "cross_curvature": {
+            "enabled": bool(measure_cross_curvature),
+            "matrix_orientation": "rows are target i, columns are source j; entry is C_ij=<V_i,H_ij V_j>",
+            "order": cross_curvature_order if measure_cross_curvature else None,
+            "matrix": (
+                [
+                    [_safe_float(v) for v in row]
+                    for row in cross_curvature_matrix
+                ]
+                if measure_cross_curvature and save_cross_curvature_matrix else None
+            ),
+            "matrix_saved": bool(measure_cross_curvature and save_cross_curvature_matrix),
+        },
+        "similarity_metric_primary": "cosine; higher is more similar",
+        "distance_metric": "relative_l2_after_best_scale; lower is better",
+        "plain": plain_stats,
+        "typed": typed_stats,
+        "all": all_stats,
+        "cosine_plain_t": plain_stats["cosine"],
+        "cosine_typed_t": typed_stats["cosine"],
+        "cosine_all_t": all_stats["cosine"],
+        "relative_l2_plain_t": plain_stats["relative_l2_after_best_scale"],
+        "relative_l2_typed_t": typed_stats["relative_l2_after_best_scale"],
+        "relative_l2_all_t": all_stats["relative_l2_after_best_scale"],
+        "pearson_plain_t": plain_stats["pearson"],
+        "pearson_typed_t": typed_stats["pearson"],
+        "pearson_all_t": all_stats["pearson"],
+        "ordering": {
+            "cosine_typed_gt_plain": bool(
+                typed_stats["cosine"] is not None and plain_stats["cosine"] is not None
+                and typed_stats["cosine"] > plain_stats["cosine"]
+            ),
+            "cosine_all_gt_plain": bool(
+                all_stats["cosine"] is not None and plain_stats["cosine"] is not None
+                and all_stats["cosine"] > plain_stats["cosine"]
+            ),
+            "cosine_typed_gt_all": bool(
+                typed_stats["cosine"] is not None and all_stats["cosine"] is not None
+                and typed_stats["cosine"] > all_stats["cosine"]
+            ),
+            "l2_typed_lt_plain": bool(
+                typed_stats["relative_l2_after_best_scale"] is not None
+                and plain_stats["relative_l2_after_best_scale"] is not None
+                and typed_stats["relative_l2_after_best_scale"] < plain_stats["relative_l2_after_best_scale"]
+            ),
+            "l2_all_lt_plain": bool(
+                all_stats["relative_l2_after_best_scale"] is not None
+                and plain_stats["relative_l2_after_best_scale"] is not None
+                and all_stats["relative_l2_after_best_scale"] < plain_stats["relative_l2_after_best_scale"]
+            ),
+            "l2_typed_lt_all": bool(
+                typed_stats["relative_l2_after_best_scale"] is not None
+                and all_stats["relative_l2_after_best_scale"] is not None
+                and typed_stats["relative_l2_after_best_scale"] < all_stats["relative_l2_after_best_scale"]
+            ),
+        },
+        "groups": groups_data,
+        "blocks": blocks_out,
+    }
+
+
+########################################
+#                Setup                 #
+########################################
+
+device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+torch.cuda.set_device(device)
+dist.init_process_group(backend="nccl", device_id=device)
+dist.barrier()
+assert 8 % dist.get_world_size() == 0
+
+_result_dir_override = os.getenv("MYOPT_OUTPUT_DIR", "").strip()
+if _result_dir_override:
+    RESULT_DIR = Path(_result_dir_override)
+    if not RESULT_DIR.is_absolute():
+        RESULT_DIR = REPO_ROOT / RESULT_DIR
+else:
+    RESULT_DIR = SCRIPT_PATH.parent
+logfile = None
+orscale_state_file = None
+weight_norm_file = None
+val_loss_file = None
+
+def print0(s, console=False, log=True):
+    if dist.get_rank() == 0:
+        if console:
+            print(s)
+        if log and logfile is not None:
+            with open(logfile, "a") as f:
+                print(s, file=f)
+
+
+########################################
+#           Hyperparameters            #
+########################################
+
+FIXED_SEED = int(os.getenv("MYOPT_SEED", "42"))
+if FIXED_SEED < 0:
+    raise ValueError("MYOPT_SEED must be non-negative")
+MYOPT_DIAG_MODE = os.getenv("MYOPT_DIAG_MODE", "orscale").strip().lower()
+if MYOPT_DIAG_MODE not in ("orscale", "local_quadratic"):
+    raise ValueError("MYOPT_DIAG_MODE must be orscale or local_quadratic")
+MYOPT_SCHEME = os.getenv("MYOPT_SCHEME", "plain_muon")
+VALID_MYOPT_SCHEMES = (
+    "plain_muon",
+    "typed_muonl",
+    "alllayer_muonl",
+    "orscale_general",
+    "orscale_general_decoupled_noclip",
+    "orscale_general_decoupled_clipped",
+)
+assert MYOPT_SCHEME in VALID_MYOPT_SCHEMES, \
+    f"MYOPT_SCHEME must be one of {VALID_MYOPT_SCHEMES}, got {MYOPT_SCHEME!r}"
+ALLOW_LOCAL_QUADRATIC_MUONL = bool(int(os.getenv("MYOPT_ALLOW_LOCAL_QUADRATIC_MUONL", "0")))
+if MYOPT_DIAG_MODE == "local_quadratic" and MYOPT_SCHEME != "plain_muon" and not ALLOW_LOCAL_QUADRATIC_MUONL:
+    raise ValueError(
+        "MYOPT_DIAG_MODE=local_quadratic historically measured basic Muon. "
+        "Set MYOPT_ALLOW_LOCAL_QUADRATIC_MUONL=1 to measure the same V_i/H_ii diagnostics "
+        "on a MuonL training trajectory."
+    )
+
+# Translate scheme name to optimizer internals
+SCHEME_TO_OPT = {
+    "plain_muon":                         ("plain",    0.0),
+    "typed_muonl":                        ("kindwise", 1.0),
+    "alllayer_muonl":                     ("alllayer", 1.0),
+    "orscale_general":                    ("orscale_general", 1.0),
+    "orscale_general_decoupled_noclip":   ("orscale_general_decoupled_noclip", 1.0),
+    "orscale_general_decoupled_clipped":  ("orscale_general_decoupled_clipped", 1.0),
+}
+OPT_MODE, OPT_RHO = SCHEME_TO_OPT[MYOPT_SCHEME]
+
+MYOPT_MOMENTUM     = 0.95
+MYOPT_NESTEROV     = bool(int(os.getenv("MYOPT_NESTEROV", "1")))
+MYOPT_NS_STEPS     = int(os.getenv("MYOPT_NS_STEPS", "12"))
+MYOPT_INTERVAL     = 5
+MYOPT_SCALE_EMA_BETA = 0.9
+MYOPT_LR           = float(os.getenv("MYOPT_LR", "0.03"))
+MYOPT_WD           = float(os.getenv("MYOPT_WD", "0.025"))
+MYOPT_QKV_LR       = float(os.getenv("MYOPT_QKV_LR", str(MYOPT_LR)))
+MYOPT_ATTN_PROJ_LR = float(os.getenv("MYOPT_ATTN_PROJ_LR", str(MYOPT_LR)))
+MYOPT_MLP_FC_LR    = float(os.getenv("MYOPT_MLP_FC_LR", str(MYOPT_LR)))
+MYOPT_MLP_PROJ_LR  = float(os.getenv("MYOPT_MLP_PROJ_LR", str(MYOPT_LR)))
+MYOPT_QKV_WD       = float(os.getenv("MYOPT_QKV_WD", str(MYOPT_WD)))
+MYOPT_ATTN_PROJ_WD = float(os.getenv("MYOPT_ATTN_PROJ_WD", str(MYOPT_WD)))
+MYOPT_MLP_FC_WD    = float(os.getenv("MYOPT_MLP_FC_WD", str(MYOPT_WD)))
+MYOPT_MLP_PROJ_WD  = float(os.getenv("MYOPT_MLP_PROJ_WD", str(MYOPT_WD)))
+MYOPT_COOLDOWN_FRAC = float(os.getenv("MYOPT_COOLDOWN_FRAC", "0.7"))
+if not (0.0 < MYOPT_COOLDOWN_FRAC <= 1.0):
+    raise ValueError("MYOPT_COOLDOWN_FRAC must be in (0, 1]")
+MYOPT_WEIGHT_DECAY_MODE = os.getenv("MYOPT_WEIGHT_DECAY_MODE", "decoupled").strip().lower()
+if MYOPT_WEIGHT_DECAY_MODE not in ("decoupled", "wd_in_update"):
+    raise ValueError("MYOPT_WEIGHT_DECAY_MODE must be decoupled or wd_in_update")
+MYOPT_UW_FLOOR_MODE = os.getenv("MYOPT_UW_FLOOR_MODE", "off").strip().lower()
+if MYOPT_UW_FLOOR_MODE in ("0", "false", "none", "no"):
+    MYOPT_UW_FLOOR_MODE = "off"
+if MYOPT_UW_FLOOR_MODE in ("1", "true", "constant", "const", "c"):
+    MYOPT_UW_FLOOR_MODE = "fixed"
+if MYOPT_UW_FLOOR_MODE in ("delayed", "snapshot", "step_snapshot", "step400"):
+    MYOPT_UW_FLOOR_MODE = "delayed_snapshot"
+if MYOPT_UW_FLOOR_MODE not in ("off", "fixed", "delayed_snapshot"):
+    raise ValueError("MYOPT_UW_FLOOR_MODE must be off, fixed, or delayed_snapshot")
+MYOPT_UW_FLOOR_C = float(os.getenv("MYOPT_UW_FLOOR_C", "0.0"))
+MYOPT_UW_FLOOR_CALIBRATION_STEP = int(os.getenv("MYOPT_UW_FLOOR_CALIBRATION_STEP", "400"))
+MYOPT_UW_FLOOR_EPS = float(os.getenv("MYOPT_UW_FLOOR_EPS", "1e-12"))
+if MYOPT_UW_FLOOR_MODE == "fixed" and MYOPT_UW_FLOOR_C <= 0.0:
+    raise ValueError("fixed MYOPT_UW_FLOOR_MODE requires MYOPT_UW_FLOOR_C > 0")
+if MYOPT_UW_FLOOR_CALIBRATION_STEP <= 0:
+    raise ValueError("MYOPT_UW_FLOOR_CALIBRATION_STEP must be > 0")
+if MYOPT_UW_FLOOR_EPS <= 0.0:
+    raise ValueError("MYOPT_UW_FLOOR_EPS must be > 0")
+ORSCALE_GENERAL_R_MIN = float(os.getenv("MYOPT_ORSCALE_GENERAL_R_MIN", "0.5"))
+ORSCALE_GENERAL_R_MAX = float(os.getenv("MYOPT_ORSCALE_GENERAL_R_MAX", "1.5"))
+if ORSCALE_GENERAL_R_MIN > ORSCALE_GENERAL_R_MAX:
+    raise ValueError("MYOPT_ORSCALE_GENERAL_R_MIN must be <= MYOPT_ORSCALE_GENERAL_R_MAX")
+ORSCALE_GENERAL_SHAPE_SCALE = os.getenv("MYOPT_ORSCALE_GENERAL_SHAPE_SCALE", "unit").strip().lower()
+if ORSCALE_GENERAL_SHAPE_SCALE in ("1", "none"):
+    ORSCALE_GENERAL_SHAPE_SCALE = "unit"
+elif ORSCALE_GENERAL_SHAPE_SCALE in ("muon", "main_muon"):
+    ORSCALE_GENERAL_SHAPE_SCALE = "main"
+if ORSCALE_GENERAL_SHAPE_SCALE not in ("unit", "main"):
+    raise ValueError("MYOPT_ORSCALE_GENERAL_SHAPE_SCALE must be unit or main")
+ORSCALE_GENERAL_ZERO_INIT_SAME_SCALE_GATE_FRACTION = float(os.getenv(
+    "MYOPT_ORSCALE_ZERO_INIT_SAME_SCALE_GATE_FRACTION",
+    "0.0",
+))
+if ORSCALE_GENERAL_ZERO_INIT_SAME_SCALE_GATE_FRACTION < 0.0:
+    raise ValueError("MYOPT_ORSCALE_ZERO_INIT_SAME_SCALE_GATE_FRACTION must be >= 0")
+DIAG_FREQ          = int(os.getenv("MYOPT_DIAG_FREQ", "250"))
+ORSCALE_L_INIT_POWER_ITERS = int(os.getenv(
+    "MYOPT_ORSCALE_L_INIT_POWER_ITERS",
+    os.getenv("MYOPT_ORSCALE_GGN_POWER_ITERS", "3"),
+))
+ORSCALE_L_REFRESH_DIAG_INTERVAL = int(os.getenv("MYOPT_ORSCALE_L_REFRESH_DIAG_INTERVAL", "10"))
+ORSCALE_L_REFRESH_POWER_ITERS = int(os.getenv("MYOPT_ORSCALE_L_REFRESH_POWER_ITERS", "1"))
+ORSCALE_L_BLOCKS_PER_DIAG = int(os.getenv("MYOPT_ORSCALE_L_BLOCKS_PER_DIAG", "4"))
+ORSCALE_L_ESTIMATOR = os.getenv("MYOPT_ORSCALE_L_ESTIMATOR", "microbatch_fisher_gram").strip().lower()
+if ORSCALE_L_ESTIMATOR not in ("microbatch_fisher_gram", "rank1_fisher", "ggn"):
+    raise ValueError("MYOPT_ORSCALE_L_ESTIMATOR must be microbatch_fisher_gram, rank1_fisher, or ggn")
+ORSCALE_GGN_MBS = int(os.getenv("MYOPT_ORSCALE_GGN_MBS", "1"))
+ORSCALE_MAX_BLOCKS = int(os.getenv("MYOPT_ORSCALE_MAX_BLOCKS", "0"))
+ORSCALE_L_FLOOR = float(os.getenv("MYOPT_ORSCALE_L_FLOOR", "1e-12"))
+ORSCALE_EPS_W = float(os.getenv("MYOPT_ORSCALE_EPS_W", "1e-12"))
+LOCAL_QUADRATIC_HVP_MBS = int(os.getenv("MYOPT_LOCAL_QUADRATIC_HVP_MBS", os.getenv("MYOPT_ORSCALE_GGN_MBS", "1")))
+LOCAL_QUADRATIC_MAX_BLOCKS = int(os.getenv("MYOPT_LOCAL_QUADRATIC_MAX_BLOCKS", os.getenv("MYOPT_ORSCALE_MAX_BLOCKS", "0")))
+LOCAL_QUADRATIC_EPS_DEN = float(os.getenv("MYOPT_LOCAL_QUADRATIC_EPS_DEN", "1e-30"))
+LOCAL_QUADRATIC_CURVATURE_METHOD = os.getenv("MYOPT_LOCAL_QUADRATIC_CURVATURE", "exact_hvp").strip().lower()
+if LOCAL_QUADRATIC_CURVATURE_METHOD in ("random_fd", "fd", "random_sign_fd"):
+    LOCAL_QUADRATIC_CURVATURE_METHOD = "random_grad_fd"
+if LOCAL_QUADRATIC_CURVATURE_METHOD in ("loss_fd", "block_fd", "blockwise_loss_fd"):
+    LOCAL_QUADRATIC_CURVATURE_METHOD = "block_loss_fd"
+if LOCAL_QUADRATIC_CURVATURE_METHOD not in ("exact_hvp", "random_grad_fd", "block_loss_fd"):
+    raise ValueError("MYOPT_LOCAL_QUADRATIC_CURVATURE must be exact_hvp, random_grad_fd, or block_loss_fd")
+LOCAL_QUADRATIC_FD_PROBES = int(os.getenv("MYOPT_LOCAL_QUADRATIC_FD_PROBES", "4"))
+LOCAL_QUADRATIC_FD_REL_EPS = float(os.getenv("MYOPT_LOCAL_QUADRATIC_FD_REL_EPS", "1e-3"))
+LOCAL_QUADRATIC_FD_ABS_EPS = float(os.getenv("MYOPT_LOCAL_QUADRATIC_FD_ABS_EPS", "1e-4"))
+LOCAL_QUADRATIC_CROSS_CURVATURE = bool(int(os.getenv("MYOPT_LOCAL_QUADRATIC_CROSS_CURVATURE", "0")))
+LOCAL_QUADRATIC_SAVE_CROSS_CURVATURE_MATRIX = bool(int(os.getenv("MYOPT_LOCAL_QUADRATIC_SAVE_CROSS_CURVATURE_MATRIX", "1")))
+if LOCAL_QUADRATIC_CROSS_CURVATURE and LOCAL_QUADRATIC_CURVATURE_METHOD != "exact_hvp":
+    raise ValueError("MYOPT_LOCAL_QUADRATIC_CROSS_CURVATURE=1 requires MYOPT_LOCAL_QUADRATIC_CURVATURE=exact_hvp")
+LOCAL_QUADRATIC_DATA_SOURCE = os.getenv("MYOPT_LOCAL_QUADRATIC_DATA_SOURCE", "train_batch").strip().lower()
+if LOCAL_QUADRATIC_DATA_SOURCE in ("train", "current_train", "current_training_batch"):
+    LOCAL_QUADRATIC_DATA_SOURCE = "train_batch"
+if LOCAL_QUADRATIC_DATA_SOURCE in ("val", "fixed_val", "validation"):
+    LOCAL_QUADRATIC_DATA_SOURCE = "fixed_val"
+if LOCAL_QUADRATIC_DATA_SOURCE not in ("train_batch", "fixed_val"):
+    raise ValueError("MYOPT_LOCAL_QUADRATIC_DATA_SOURCE must be train_batch or fixed_val")
+LOCAL_QUADRATIC_GRAD_WINDOW_RADIUS = int(os.getenv("MYOPT_LOCAL_QUADRATIC_GRAD_WINDOW_RADIUS", "0"))
+LOCAL_QUADRATIC_GRAD_WINDOW_ENABLED = bool(LOCAL_QUADRATIC_GRAD_WINDOW_RADIUS > 0 and MYOPT_DIAG_MODE == "local_quadratic")
+LOCAL_QUADRATIC_GRAD_NUC_EPS = float(os.getenv("MYOPT_LOCAL_QUADRATIC_GRAD_NUC_EPS", "1e-30"))
+LOCAL_QUADRATIC_GRAD_CRITERION_MODE = os.getenv("MYOPT_LOCAL_QUADRATIC_GRAD_CRITERION_MODE", "by_type").strip().lower()
+if LOCAL_QUADRATIC_GRAD_CRITERION_MODE in ("type", "typed", "bytype", "by_type"):
+    LOCAL_QUADRATIC_GRAD_CRITERION_MODE = "by_type"
+if LOCAL_QUADRATIC_GRAD_CRITERION_MODE in ("all", "alllayer", "all_layer", "all_layers", "all_layer_m", "alllayer_m"):
+    LOCAL_QUADRATIC_GRAD_CRITERION_MODE = "all_layer_m"
+if LOCAL_QUADRATIC_GRAD_CRITERION_MODE not in ("by_type", "all_layer_m"):
+    raise ValueError("MYOPT_LOCAL_QUADRATIC_GRAD_CRITERION_MODE must be by_type or all_layer_m")
+LOCAL_QUADRATIC_EXACT_HVP_EAGER_DIAG_MODEL = bool(
+    MYOPT_DIAG_MODE == "local_quadratic"
+    and LOCAL_QUADRATIC_CURVATURE_METHOD == "exact_hvp"
+)
+MYOPT_SAVE_DIAG = bool(int(os.getenv("MYOPT_SAVE_DIAG", "0")))
+MYOPT_SAVE_LOG = bool(int(os.getenv("MYOPT_SAVE_LOG", "1" if MYOPT_SAVE_DIAG else "0")))
+MYOPT_SAVE_ORSCALE_STATE = bool(int(os.getenv("MYOPT_SAVE_ORSCALE_STATE", "0")))
+MYOPT_ORSCALE_STATE_FREQ = int(os.getenv("MYOPT_ORSCALE_STATE_FREQ", str(DIAG_FREQ)))
+if MYOPT_ORSCALE_STATE_FREQ <= 0:
+    raise ValueError("MYOPT_ORSCALE_STATE_FREQ must be > 0")
+MYOPT_SAVE_WEIGHT_NORMS = bool(int(os.getenv("MYOPT_SAVE_WEIGHT_NORMS", "0")))
+MYOPT_WEIGHT_NORM_FREQ = int(os.getenv("MYOPT_WEIGHT_NORM_FREQ", "1"))
+if MYOPT_WEIGHT_NORM_FREQ <= 0:
+    raise ValueError("MYOPT_WEIGHT_NORM_FREQ must be > 0")
+MYOPT_SAVE_VAL_LOSS_JSONL = bool(int(os.getenv("MYOPT_SAVE_VAL_LOSS_JSONL", "0")))
+
+EARLY_VAL_STEP_FREQ = 125
+MID_VAL_STEP_FREQ   = int(os.getenv("MYOPT_MID_VAL_FREQ", "25"))
+MID_VAL_START_STEP  = int(os.getenv("MYOPT_MID_VAL_START", "3000"))
+LATE_VAL_STEP_FREQ  = int(os.getenv("MYOPT_LATE_VAL_FREQ", "10"))
+LATE_VAL_START_STEP = int(os.getenv("MYOPT_LATE_VAL_START", "3200"))
+train_steps         = int(os.getenv("MYOPT_TRAIN_STEPS", "3300"))
+schedule_steps      = int(os.getenv("MYOPT_SCHEDULE_STEPS", str(train_steps)))
+
+sequence_length = 1024
+train_microbatches = 8
+batch_size  = 8 * 64 * sequence_length
+train_microbatch_sequences = batch_size // (sequence_length * train_microbatches)
+diag_mbs    = int(os.getenv("MYOPT_DIAG_MBS", "64"))
+diag_grad_mbs = int(os.getenv("MYOPT_DIAG_GRAD_MBS", str(train_microbatch_sequences)))
+val_tokens  = int(os.getenv("MYOPT_VAL_TOKENS", str(20 * 524288)))
+
+LOCAL_QUADRATIC_DONATED_BUFFER_DISABLED = False
+if MYOPT_DIAG_MODE == "local_quadratic":
+    try:
+        import torch._functorch.config as _functorch_config
+        _functorch_config.donated_buffer = False
+        LOCAL_QUADRATIC_DONATED_BUFFER_DISABLED = True
+    except Exception:
+        LOCAL_QUADRATIC_DONATED_BUFFER_DISABLED = False
+
+########################################
+#          Data & Model Init           #
+########################################
+
+val_inputs, val_targets = next(distributed_data_generator(
+    str(DATA_DIR / "fineweb_val_*.bin"), val_tokens))
+
+# Diagnostic batch: first diag_mbs sequences from val data (fixed, same across all steps)
+diag_inputs  = val_inputs[:diag_mbs]
+diag_targets = val_targets[:diag_mbs]
+
+model = GPT(vocab_size=50304, num_layers=12, model_dim=768).cuda()
+
+torch.manual_seed(FIXED_SEED)
+torch.cuda.manual_seed_all(FIXED_SEED)
+
+for name, p in model.named_parameters():
+    w = p.data
+    if name.endswith("weight"):
+        if "proj" in name:
+            w.zero_()
+        elif "embed" in name:
+            w.normal_()
+        else:
+            w.normal_(std=0.33**0.5 / w.size(-1)**0.5)
+    elif name.endswith("bias"):
+        w.zero_()
+    elif name.endswith("gains"):
+        w.normal_(mean=1, std=0)
+    else:
+        raise Exception(f"Uninitialized parameter: {name}")
+
+train_model = torch.compile(model, dynamic=False)
+
+########################################
+#            Optimizers                #
+########################################
+
+optimizer1 = AdamW(
+    [dict(params=[model.embed.weight], lr=0.3),
+     dict(params=[model.proj.weight], lr=1/320),
+     dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.01)],
+    betas=(0.8, 0.95), eps=1e-10, weight_decay=0, fused=True)
+
+named_block_params = [(n, p) for n, p in model.named_parameters()
+                      if n.startswith("blocks.") and p.ndim >= 2]
+qkv_named      = [(n, p) for n, p in named_block_params
+                  if n.endswith((".attn.q.weight", ".attn.k.weight", ".attn.v.weight"))]
+attn_out_named = [(n, p) for n, p in named_block_params if n.endswith(".attn.proj.weight")]
+mlp_fc_named   = [(n, p) for n, p in named_block_params if n.endswith(".mlp.fc.weight")]
+mlp_proj_named = [(n, p) for n, p in named_block_params if n.endswith(".mlp.proj.weight")]
+param_name_by_id = {id(p): n for n, p in named_block_params}
+
+optimizer2 = DistributedMuonLKindwise(
+    [dict(params=[p for _, p in qkv_named],      lr=MYOPT_QKV_LR,       weight_decay=MYOPT_QKV_WD,       label="q/k/v"),
+     dict(params=[p for _, p in attn_out_named],  lr=MYOPT_ATTN_PROJ_LR, weight_decay=MYOPT_ATTN_PROJ_WD, label="attn.proj"),
+     dict(params=[p for _, p in mlp_fc_named],    lr=MYOPT_MLP_FC_LR,    weight_decay=MYOPT_MLP_FC_WD,    label="mlp.fc"),
+     dict(params=[p for _, p in mlp_proj_named],  lr=MYOPT_MLP_PROJ_LR,  weight_decay=MYOPT_MLP_PROJ_WD,  label="mlp.proj")],
+    param_names=param_name_by_id,
+    momentum=MYOPT_MOMENTUM,
+    ns_steps=MYOPT_NS_STEPS,
+    nesterov=MYOPT_NESTEROV,
+    rho=OPT_RHO,
+    interval=MYOPT_INTERVAL,
+    scheme=OPT_MODE,
+    scale_ema_beta=MYOPT_SCALE_EMA_BETA,
+    weight_decay_mode=MYOPT_WEIGHT_DECAY_MODE,
+    orscale_r_min=ORSCALE_GENERAL_R_MIN,
+    orscale_r_max=ORSCALE_GENERAL_R_MAX,
+    orscale_general_shape_scale=ORSCALE_GENERAL_SHAPE_SCALE,
+    orscale_zero_init_same_scale_gate_fraction=ORSCALE_GENERAL_ZERO_INIT_SAME_SCALE_GATE_FRACTION,
+    uw_floor_mode=MYOPT_UW_FLOOR_MODE,
+    uw_floor_c=MYOPT_UW_FLOOR_C,
+    uw_floor_calibration_step=MYOPT_UW_FLOOR_CALIBRATION_STEP,
+    uw_floor_eps=MYOPT_UW_FLOOR_EPS,
+)
+optimizers = [optimizer1, optimizer2]
+for opt in optimizers:
+    for group in opt.param_groups:
+        group["initial_lr"] = group["lr"]
+
+########################################
+#          Logging setup               #
+########################################
+
+diag_file = None
+grad_window_file = None
+grad_window_criteria_file = None
+grad_window_criteria_csv = None
+if dist.get_rank() == 0 and (
+    MYOPT_SAVE_LOG
+    or MYOPT_SAVE_DIAG
+    or MYOPT_SAVE_ORSCALE_STATE
+    or MYOPT_SAVE_WEIGHT_NORMS
+    or MYOPT_SAVE_VAL_LOSS_JSONL
+):
+    RESULT_DIR.mkdir(parents=True, exist_ok=True)
+    log_stem_override = os.getenv("MYOPT_LOG_STEM", "").strip()
+    default_log_stem = log_stem_override or (
+        f"seed{FIXED_SEED}_{MYOPT_SCHEME}_orscale"
+        if MYOPT_DIAG_MODE == "orscale" else
+        f"seed{FIXED_SEED}_{MYOPT_SCHEME}_local_quadratic"
+    )
+    if MYOPT_SAVE_LOG or MYOPT_SAVE_DIAG:
+        logfile = RESULT_DIR / f"{default_log_stem}.txt"
+    if MYOPT_SAVE_DIAG:
+        diag_json_override = os.getenv("MYOPT_DIAG_JSON", "").strip()
+        if diag_json_override:
+            diag_file = Path(diag_json_override)
+            if not diag_file.is_absolute():
+                diag_file = RESULT_DIR / diag_file
+        else:
+            diag_file = RESULT_DIR / f"{default_log_stem}_diag.json"
+        if LOCAL_QUADRATIC_GRAD_WINDOW_ENABLED:
+            grad_window_file = RESULT_DIR / f"{default_log_stem}_grad_nuclear_window.json"
+            grad_window_criteria_file = RESULT_DIR / f"{default_log_stem}_grad_window_criteria.json"
+            grad_window_criteria_csv = RESULT_DIR / f"{default_log_stem}_grad_window_criteria.csv"
+    if MYOPT_SAVE_ORSCALE_STATE:
+        orscale_state_file = RESULT_DIR / f"{default_log_stem}_orscale_state.jsonl"
+        orscale_state_file.write_text("")
+    if MYOPT_SAVE_WEIGHT_NORMS:
+        weight_norm_file = RESULT_DIR / f"{default_log_stem}_weight_norms.jsonl"
+        weight_norm_file.write_text("")
+    if MYOPT_SAVE_VAL_LOSS_JSONL:
+        val_loss_file = RESULT_DIR / f"{default_log_stem}_val_loss.jsonl"
+        val_loss_file.write_text("")
+    if logfile is not None:
+        logfile.write_text("")
+        print(f"logfile: {logfile}")
+    if diag_file is not None:
+        print(f"diag_file: {diag_file}")
+    if orscale_state_file is not None:
+        print(f"orscale_state_file: {orscale_state_file}")
+    if weight_norm_file is not None:
+        print(f"weight_norm_file: {weight_norm_file}")
+    if val_loss_file is not None:
+        print(f"val_loss_file: {val_loss_file}")
+    if grad_window_file is not None:
+        print(f"grad_window_file: {grad_window_file}")
+        print(f"grad_window_criteria_file: {grad_window_criteria_file}")
+        print(f"grad_window_criteria_csv: {grad_window_criteria_csv}")
+elif dist.get_rank() == 0:
+    print("save_log:false save_diag:false")
+
+print0(code)
+print0("=" * 100)
+print0(f"scheme:{MYOPT_SCHEME} opt_mode:{OPT_MODE} rho:{OPT_RHO}"
+       + f" ns_steps:{MYOPT_NS_STEPS} momentum:{MYOPT_MOMENTUM}"
+       + f" nesterov:{MYOPT_NESTEROV}"
+       + f" scale_ema_beta:{MYOPT_SCALE_EMA_BETA} interval:{MYOPT_INTERVAL}",
+       console=True)
+print0(
+    f"matrix_lr_base:{MYOPT_LR} matrix_weight_decay_base:{MYOPT_WD}"
+    f" weight_decay_mode:{MYOPT_WEIGHT_DECAY_MODE}"
+    f" zero_init_trust_floor_scale:{ZERO_INIT_TRUST_FLOOR_SCALE}",
+    console=True,
+)
+for _group in optimizer2.param_groups:
+    print0(
+        f"matrix_group:{_group.get('label', '')}"
+        f" initial_lr:{_group['initial_lr']}"
+        f" weight_decay:{_group['weight_decay']}",
+        console=True,
+    )
+print0(
+    f"uw_floor_mode:{MYOPT_UW_FLOOR_MODE}"
+    f" uw_floor_c:{MYOPT_UW_FLOOR_C}"
+    f" uw_floor_calibration_step:{MYOPT_UW_FLOOR_CALIBRATION_STEP}"
+    f" uw_floor_eps:{MYOPT_UW_FLOOR_EPS}",
+    console=True,
+)
+if OPT_MODE == "orscale_general":
+    print0(
+        "orscale_general: wd_in_direction_only:true"
+        " no_decoupled_weight_decay:true moonlight_shape_factor:1"
+        f" shape_scale_mode:{ORSCALE_GENERAL_SHAPE_SCALE}"
+        f" trust_ratio_clip:[{ORSCALE_GENERAL_R_MIN},{ORSCALE_GENERAL_R_MAX}]"
+        f" zero_init_same_scale_gate_fraction:{ORSCALE_GENERAL_ZERO_INIT_SAME_SCALE_GATE_FRACTION}",
+        console=True,
+    )
+elif OPT_MODE == "orscale_general_decoupled_noclip":
+    print0(
+        "orscale_general_decoupled_noclip: wd_in_direction:false"
+        " decoupled_weight_decay:true moonlight_shape_factor:1"
+        f" shape_scale_mode:{ORSCALE_GENERAL_SHAPE_SCALE}"
+        " trust_ratio_clip:none trust_ratio:||W||_F/(||Q_s||_F+eps)"
+        " aligned_update:(||W||_F/(||Q_s||_F+eps))*Q_s",
+        console=True,
+    )
+elif OPT_MODE == "orscale_general_decoupled_clipped":
+    print0(
+        "orscale_general_decoupled_clipped: wd_in_direction:false"
+        " decoupled_weight_decay:true moonlight_shape_factor:1"
+        f" shape_scale_mode:{ORSCALE_GENERAL_SHAPE_SCALE}"
+        f" trust_ratio_clip:[{ORSCALE_GENERAL_R_MIN},{ORSCALE_GENERAL_R_MAX}]"
+        " trust_ratio:||W||_F/(||Q_s||_F+eps)"
+        " aligned_update:clip(||W||_F/(||Q_s||_F+eps))*Q_s",
+        console=True,
+    )
+print0(
+    f"schedule_cooldown_frac:{MYOPT_COOLDOWN_FRAC}"
+    f" previous_muonl_experiment_cooldown_frac:0.7",
+    console=True,
+)
+print0(
+    f"validation_frequency early:{EARLY_VAL_STEP_FREQ}"
+    f" mid:{MID_VAL_STEP_FREQ}@{MID_VAL_START_STEP}"
+    f" late:{LATE_VAL_STEP_FREQ}@{LATE_VAL_START_STEP}",
+    console=True,
+)
+print0(f"seed:{FIXED_SEED} train_steps:{train_steps} schedule_steps:{schedule_steps} diag_freq:{DIAG_FREQ}", console=True)
+print0(
+    f"batch_tokens:{batch_size} train_microbatches:{train_microbatches}"
+    f" train_microbatch_sequences:{train_microbatch_sequences} val_tokens:{val_tokens}",
+    console=True,
+)
+print0(
+    f"save_log:{bool(MYOPT_SAVE_LOG)} save_diag:{bool(MYOPT_SAVE_DIAG)}"
+    f" save_orscale_state:{bool(MYOPT_SAVE_ORSCALE_STATE)}"
+    f" orscale_state_freq:{MYOPT_ORSCALE_STATE_FREQ}",
+    console=True,
+)
+print0(
+    f"save_weight_norms:{bool(MYOPT_SAVE_WEIGHT_NORMS)}"
+    f" weight_norm_freq:{MYOPT_WEIGHT_NORM_FREQ}"
+    f" save_val_loss_jsonl:{bool(MYOPT_SAVE_VAL_LOSS_JSONL)}",
+    console=True,
+)
+if MYOPT_SAVE_DIAG:
+    print0(f"diag_mode:{MYOPT_DIAG_MODE}", console=True)
+    print0(
+        f"diag_batch_size:{diag_mbs} diag_tokens:{diag_mbs*sequence_length}"
+        f" diag_grad_mbs:{diag_grad_mbs} local_quadratic_data_source:{LOCAL_QUADRATIC_DATA_SOURCE}",
+        console=True,
+    )
+    if MYOPT_DIAG_MODE == "local_quadratic" and LOCAL_QUADRATIC_DATA_SOURCE == "train_batch":
+        print0(
+            "local_quadratic_train_batch_scope:full_optimizer_step"
+            f" local_quadratic_train_batch_sequences:{train_microbatches * train_microbatch_sequences}"
+            f" local_quadratic_train_batch_tokens:{batch_size}",
+            console=True,
+        )
+    print0(
+        f"orscale_L_estimator:{ORSCALE_L_ESTIMATOR}"
+        f" L_init_power_iters:{ORSCALE_L_INIT_POWER_ITERS}"
+        f" L_refresh_diag_interval:{ORSCALE_L_REFRESH_DIAG_INTERVAL}"
+        f" L_refresh_power_iters:{ORSCALE_L_REFRESH_POWER_ITERS}"
+        f" L_blocks_per_diag:{ORSCALE_L_BLOCKS_PER_DIAG}"
+        f" ggn_mbs:{ORSCALE_GGN_MBS} max_blocks:{ORSCALE_MAX_BLOCKS}"
+        f" L_floor:{ORSCALE_L_FLOOR} eps_w:{ORSCALE_EPS_W}",
+        console=True,
+    )
+    print0(
+        f"local_quadratic_hvp_mbs:{LOCAL_QUADRATIC_HVP_MBS}"
+        f" local_quadratic_max_blocks:{LOCAL_QUADRATIC_MAX_BLOCKS}"
+        f" local_quadratic_eps_den:{LOCAL_QUADRATIC_EPS_DEN}"
+        f" local_quadratic_curvature:{LOCAL_QUADRATIC_CURVATURE_METHOD}"
+        f" local_quadratic_fd_probes:{LOCAL_QUADRATIC_FD_PROBES}"
+        f" local_quadratic_fd_rel_eps:{LOCAL_QUADRATIC_FD_REL_EPS}"
+        f" local_quadratic_fd_abs_eps:{LOCAL_QUADRATIC_FD_ABS_EPS}"
+        f" local_quadratic_cross_curvature:{LOCAL_QUADRATIC_CROSS_CURVATURE}"
+        f" local_quadratic_save_cross_curvature_matrix:{LOCAL_QUADRATIC_SAVE_CROSS_CURVATURE_MATRIX}"
+        f" local_quadratic_donated_buffer_disabled:{LOCAL_QUADRATIC_DONATED_BUFFER_DISABLED}",
+        console=True,
+    )
+    print0(
+        f"allow_local_quadratic_muonl:{ALLOW_LOCAL_QUADRATIC_MUONL}"
+        f" local_quadratic_grad_window_enabled:{LOCAL_QUADRATIC_GRAD_WINDOW_ENABLED}"
+        f" local_quadratic_grad_window_radius:{LOCAL_QUADRATIC_GRAD_WINDOW_RADIUS}"
+        f" local_quadratic_grad_criterion_mode:{LOCAL_QUADRATIC_GRAD_CRITERION_MODE}"
+        f" local_quadratic_grad_nuc_eps:{LOCAL_QUADRATIC_GRAD_NUC_EPS}",
+        console=True,
+    )
+print0("step:S val_loss is after S optimizer updates", console=True)
+
+
+def _write_json_atomic(path: Path, payload) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w") as f:
+        json.dump(payload, f)
+    tmp.replace(path)
+
+
+def _state_float_or_none(state: dict, key: str) -> float | None:
+    value = state.get(key)
+    if value is None:
+        return None
+    return _safe_float_or_none(value)
+
+
+def _append_jsonl(path: Path, payload: dict) -> None:
+    with path.open("a") as f:
+        json.dump(payload, f)
+        f.write("\n")
+
+
+def _append_orscale_state_record(step_index: int, train_loss: float, lr_current: float) -> None:
+    if not (
+        dist.get_rank() == 0
+        and MYOPT_SAVE_ORSCALE_STATE
+        and OPT_MODE in (
+            "orscale_general",
+            "orscale_general_decoupled_noclip",
+            "orscale_general_decoupled_clipped",
+        )
+        and orscale_state_file is not None
+    ):
+        return
+    blocks = []
+    for group in optimizer2.param_groups:
+        label = str(group.get("label", ""))
+        for p in group["params"]:
+            if p.ndim < 2:
+                continue
+            state = optimizer2.state[p]
+            if "orscale_general_effective_trust_ratio" not in state:
+                continue
+            name = optimizer2._param_name_by_id.get(id(p), f"id_{id(p)}")
+            kind = optimizer2._matrix_kind(p)
+            block_idx = optimizer2._param_block_by_id.get(id(p), -1)
+            blocks.append({
+                "step": int(step_index),
+                "param_name": name,
+                "group_label": label,
+                "type": kind,
+                "block_idx": int(block_idx),
+                "shape": list(p.shape),
+                "numel": int(p.numel()),
+                "w_norm_pre_update": _state_float_or_none(state, "cached_w_norm"),
+                "q_norm": _state_float_or_none(state, "orscale_general_q_norm"),
+                "shape_scale": _state_float_or_none(state, "orscale_general_shape_scale"),
+                "shape_scale_mode": str(state.get("orscale_general_shape_scale_mode", "")),
+                "direction_norm": _state_float_or_none(state, "orscale_general_direction_norm"),
+                "raw_trust_ratio": _state_float_or_none(state, "orscale_general_raw_trust_ratio"),
+                "clipped_trust_ratio": _state_float_or_none(state, "orscale_general_clipped_trust_ratio"),
+                "effective_trust_ratio": _state_float_or_none(state, "orscale_general_effective_trust_ratio"),
+                "zero_init_same_scale_gate_enabled": bool(
+                    state.get("orscale_general_zero_init_same_scale_gate_enabled", False)
+                ),
+                "zero_init_same_scale_gate_open": bool(
+                    state.get("orscale_general_zero_init_same_scale_gate_open", True)
+                ),
+                "zero_init_same_scale_gate_status": str(
+                    state.get("orscale_general_zero_init_same_scale_gate_status", "standard")
+                ),
+                "zero_init_same_scale_gate_fraction": _safe_float_or_none(
+                    state.get("orscale_general_zero_init_same_scale_gate_fraction")
+                ),
+                "same_scale_normal_w_norm_min": _state_float_or_none(
+                    state, "orscale_general_same_scale_normal_w_norm_min"
+                ),
+                "same_scale_normal_w_norm_count": int(
+                    state.get("orscale_general_same_scale_normal_w_norm_count", 0)
+                ),
+                "w_norm_gate_threshold": _state_float_or_none(
+                    state, "orscale_general_w_norm_gate_threshold"
+                ),
+                "variant": str(state.get("orscale_general_variant", "")),
+                "weight_decay_coupled_in_direction": bool(
+                    state.get("orscale_general_weight_decay_coupled_in_direction", False)
+                ),
+                "decoupled_weight_decay_applied": bool(
+                    state.get("orscale_general_decoupled_weight_decay_applied", False)
+                ),
+                "trust_ratio_clipped": bool(
+                    state.get("orscale_general_trust_ratio_clipped", False)
+                ),
+                "clip_min": _safe_float_or_none(state.get("orscale_general_clip_min")),
+                "clip_max": _safe_float_or_none(state.get("orscale_general_clip_max")),
+            })
+    blocks.sort(key=lambda b: (b["type"], b["block_idx"], b["param_name"]))
+    record = {
+        "step": int(step_index),
+        "train_loss": _safe_float(train_loss),
+        "matrix_lr": _safe_float(lr_current),
+        "blocks": blocks,
+    }
+    with orscale_state_file.open("a") as f:
+        json.dump(record, f)
+        f.write("\n")
+
+
+@torch.no_grad()
+def _append_weight_norm_record(
+    step_index: int,
+    train_loss: float | None,
+    lr_current: float,
+    event: str,
+) -> None:
+    if not (
+        dist.get_rank() == 0
+        and MYOPT_SAVE_WEIGHT_NORMS
+        and weight_norm_file is not None
+    ):
+        return
+    blocks = []
+    for group in optimizer2.param_groups:
+        label = str(group.get("label", ""))
+        for p in group["params"]:
+            if p.ndim < 2:
+                continue
+            state = optimizer2.state.get(p, {})
+            name = optimizer2._param_name_by_id.get(id(p), f"id_{id(p)}")
+            kind = optimizer2._matrix_kind(p)
+            block_idx = optimizer2._param_block_by_id.get(id(p), -1)
+            blocks.append({
+                "step": int(step_index),
+                "event": event,
+                "param_name": name,
+                "group_label": label,
+                "type": kind,
+                "block_idx": int(block_idx),
+                "shape": list(p.shape),
+                "numel": int(p.numel()),
+                "w_norm": _safe_float(torch.linalg.vector_norm(p.detach().float()).item()),
+                "w_norm_pre_update_state": _state_float_or_none(state, "cached_w_norm"),
+                "q_norm": _state_float_or_none(state, "orscale_general_q_norm"),
+                "shape_scale": _state_float_or_none(state, "orscale_general_shape_scale"),
+                "shape_scale_mode": str(state.get("orscale_general_shape_scale_mode", "")),
+                "direction_norm": _state_float_or_none(state, "orscale_general_direction_norm"),
+                "raw_trust_ratio": _state_float_or_none(state, "orscale_general_raw_trust_ratio"),
+                "effective_trust_ratio": _state_float_or_none(
+                    state, "orscale_general_effective_trust_ratio"
+                ),
+                "uw_floor_mode": str(state.get("uw_floor_mode", "")),
+                "uw_floor_raw_ratio": _state_float_or_none(state, "uw_floor_raw_ratio"),
+                "uw_floor_target": _state_float_or_none(state, "uw_floor_target"),
+                "uw_floor_scale": _state_float_or_none(state, "uw_floor_scale"),
+                "uw_floor_applied": bool(state.get("uw_floor_applied", False)),
+                "uw_floor_snapshot_step": (
+                    None
+                    if state.get("uw_floor_snapshot_step") is None else
+                    int(state.get("uw_floor_snapshot_step"))
+                ),
+                "variant": str(state.get("orscale_general_variant", "")),
+                "weight_decay_coupled_in_direction": bool(
+                    state.get("orscale_general_weight_decay_coupled_in_direction", False)
+                ),
+                "decoupled_weight_decay_applied": bool(
+                    state.get("orscale_general_decoupled_weight_decay_applied", False)
+                ),
+                "trust_ratio_clipped": bool(
+                    state.get("orscale_general_trust_ratio_clipped", False)
+                ),
+            })
+    blocks.sort(key=lambda b: (b["block_idx"], b["type"], b["param_name"]))
+
+    by_type: dict[str, list[float]] = {}
+    for block in blocks:
+        w_norm = block["w_norm"]
+        if w_norm is not None:
+            by_type.setdefault(block["type"], []).append(float(w_norm))
+    type_summary = []
+    for kind in sorted(by_type):
+        vals = by_type[kind]
+        type_summary.append({
+            "type": kind,
+            "count": len(vals),
+            "mean_w_norm": _safe_float(sum(vals) / max(len(vals), 1)),
+            "min_w_norm": _safe_float(min(vals)),
+            "max_w_norm": _safe_float(max(vals)),
+        })
+
+    _append_jsonl(weight_norm_file, {
+        "step": int(step_index),
+        "event": event,
+        "scheme": MYOPT_SCHEME,
+        "opt_mode": OPT_MODE,
+        "seed": int(FIXED_SEED),
+        "train_loss": _safe_float_or_none(train_loss),
+        "matrix_lr": _safe_float(lr_current),
+        "block_count": len(blocks),
+        "type_summary": type_summary,
+        "blocks": blocks,
+    })
+
+
+def _append_val_loss_record(
+    step_index: int,
+    val_loss_per_tok: float,
+    train_time: float,
+    step_avg_ms: float,
+) -> None:
+    if not (
+        dist.get_rank() == 0
+        and MYOPT_SAVE_VAL_LOSS_JSONL
+        and val_loss_file is not None
+    ):
+        return
+    _append_jsonl(val_loss_file, {
+        "step": int(step_index),
+        "scheme": MYOPT_SCHEME,
+        "opt_mode": OPT_MODE,
+        "seed": int(FIXED_SEED),
+        "val_loss": _safe_float(val_loss_per_tok),
+        "train_time": _safe_float(train_time),
+        "step_avg_ms": _safe_float(step_avg_ms),
+        "matrix_lrs": {
+            str(group.get("label", "")): _safe_float(group.get("initial_lr", group["lr"]))
+            for group in optimizer2.param_groups
+        },
+        "matrix_weight_decays": {
+            str(group.get("label", "")): _safe_float(group["weight_decay"])
+            for group in optimizer2.param_groups
+        },
+        "uw_floor_mode": MYOPT_UW_FLOOR_MODE,
+        "uw_floor_target": (
+            _safe_float(MYOPT_UW_FLOOR_C)
+            if MYOPT_UW_FLOOR_MODE == "fixed" else
+            _safe_float_or_none(optimizer2.uw_floor_snapshot_target)
+        ),
+        "uw_floor_snapshot_step": optimizer2.uw_floor_snapshot_step,
+    })
+
+
+def _local_quadratic_grad_window_centers_for_step(step_index: int) -> list[int]:
+    if not LOCAL_QUADRATIC_GRAD_WINDOW_ENABLED:
+        return []
+    radius = int(LOCAL_QUADRATIC_GRAD_WINDOW_RADIUS)
+    lo = max(DIAG_FREQ, step_index - radius)
+    hi = min(train_steps, step_index + radius)
+    first = ((lo + DIAG_FREQ - 1) // DIAG_FREQ) * DIAG_FREQ
+    centers = []
+    center = first
+    while center <= hi:
+        if center != step_index and abs(step_index - center) <= radius:
+            centers.append(int(center))
+        center += DIAG_FREQ
+    return centers
+
+
+@torch.no_grad()
+def _collect_grad_nuclear_window_step(step_index: int, centers: list[int]) -> dict:
+    blocks = []
+    for group in optimizer2.param_groups:
+        for p in group["params"]:
+            if p.ndim < 2 or p.grad is None:
+                continue
+            name = optimizer2._param_name_by_id.get(id(p), f"id_{id(p)}")
+            kind = optimizer2._matrix_kind(p)
+            block_idx = optimizer2._param_block_by_id.get(id(p), -1)
+            g_mat = _tensor_to_matrix(p.grad.detach().float())
+            nuc = float(torch.linalg.matrix_norm(g_mat, ord="nuc").item())
+            blocks.append({
+                "param_name": name,
+                "type": kind,
+                "block_idx": int(block_idx),
+                "grad_nuclear_norm": _safe_float(nuc),
+            })
+    blocks.sort(key=lambda b: (b["type"], b["block_idx"], b["param_name"]))
+    return {
+        "step": int(step_index),
+        "centers": [int(c) for c in centers],
+        "blocks": blocks,
+    }
+
+
+def _compute_grad_window_criterion(diag_record: dict, window_records: list[dict]) -> dict:
+    center_step = int(diag_record["step"])
+    expected_steps = (
+        list(range(center_step - LOCAL_QUADRATIC_GRAD_WINDOW_RADIUS, center_step))
+        + list(range(center_step + 1, center_step + LOCAL_QUADRATIC_GRAD_WINDOW_RADIUS + 1))
+    )
+    records_by_step = {int(rec["step"]): rec for rec in window_records}
+    actual_steps = sorted(records_by_step)
+    missing_steps = [s for s in expected_steps if s not in records_by_step]
+
+    blocks = [
+        b for b in diag_record.get("blocks", [])
+        if (
+            b.get("v_h_v") is not None
+            and b.get("w_norm") is not None
+            and b.get("m_i") is not None
+        )
+    ]
+    if LOCAL_QUADRATIC_GRAD_CRITERION_MODE == "all_layer_m":
+        grouped_blocks: dict[str, list[dict]] = {"all_layers": blocks}
+    else:
+        grouped_blocks = {}
+        for block in blocks:
+            grouped_blocks.setdefault(block["type"], []).append(block)
+
+    groups = {}
+    for kind in sorted(grouped_blocks):
+        layer_blocks = grouped_blocks[kind]
+        block_names = [b["block_name"] for b in layer_blocks]
+        w_by_name = {b["block_name"]: float(b["w_norm"]) for b in layer_blocks}
+        l_by_name = {b["block_name"]: float(b["v_h_v"]) for b in layer_blocks}
+        m_by_name = {b["block_name"]: float(b["m_i"]) for b in layer_blocks}
+        sum_l = sum(l_by_name.values())
+        sum_l_m = sum(l_by_name[name] * m_by_name[name] for name in block_names)
+        sum_l_w2 = sum(l_by_name[name] * (w_by_name[name] ** 2) for name in block_names)
+        lhs_den = sum_l_m if LOCAL_QUADRATIC_GRAD_CRITERION_MODE == "all_layer_m" else sum_l
+        lhs = (
+            sum_l_w2 / lhs_den
+            if abs(lhs_den) > LOCAL_QUADRATIC_GRAD_NUC_EPS
+            else float("nan")
+        )
+
+        numerator_sum = 0.0
+        denominator_sum = 0.0
+        grad_nuc_sum_by_name = {name: 0.0 for name in block_names}
+        valid_window_steps = []
+        for step_i in actual_steps:
+            grad_blocks = {
+                b["param_name"]: b
+                for b in records_by_step[step_i].get("blocks", [])
+                if b.get("grad_nuclear_norm") is not None
+            }
+            den_t = 0.0
+            num_t = 0.0
+            complete = True
+            grad_nuc_this_step = {}
+            for name in block_names:
+                g_entry = grad_blocks.get(name)
+                if g_entry is None:
+                    complete = False
+                    break
+                g_nuc = float(g_entry["grad_nuclear_norm"])
+                grad_nuc_this_step[name] = g_nuc
+                den_t += g_nuc
+                if LOCAL_QUADRATIC_GRAD_CRITERION_MODE == "all_layer_m":
+                    num_t += (w_by_name[name] / math.sqrt(m_by_name[name])) * g_nuc
+                else:
+                    num_t += w_by_name[name] * g_nuc
+            if complete and den_t > LOCAL_QUADRATIC_GRAD_NUC_EPS:
+                valid_window_steps.append(int(step_i))
+                numerator_sum += num_t
+                denominator_sum += den_t
+                for name, g_nuc in grad_nuc_this_step.items():
+                    grad_nuc_sum_by_name[name] += g_nuc
+
+        grad_weighted_mean = (
+            numerator_sum / denominator_sum
+            if denominator_sum > LOCAL_QUADRATIC_GRAD_NUC_EPS
+            else float("nan")
+        )
+        rhs = grad_weighted_mean ** 2 if math.isfinite(grad_weighted_mean) else float("nan")
+        ratio = (
+            lhs / rhs
+            if math.isfinite(lhs) and math.isfinite(rhs) and abs(rhs) > LOCAL_QUADRATIC_GRAD_NUC_EPS
+            else float("nan")
+        )
+        criterion_valid = bool(
+            math.isfinite(lhs)
+            and math.isfinite(rhs)
+            and abs(rhs) > LOCAL_QUADRATIC_GRAD_NUC_EPS
+        )
+        zero_over_zero = bool(
+            math.isfinite(lhs)
+            and math.isfinite(rhs)
+            and abs(lhs) <= LOCAL_QUADRATIC_GRAD_NUC_EPS
+            and abs(rhs) <= LOCAL_QUADRATIC_GRAD_NUC_EPS
+        )
+        problem_layers = []
+        for name in block_names:
+            issues = []
+            w_norm = w_by_name[name]
+            l_i = l_by_name[name]
+            grad_nuc_sum = grad_nuc_sum_by_name[name]
+            if abs(w_norm) <= LOCAL_QUADRATIC_GRAD_NUC_EPS:
+                if abs(l_i) > LOCAL_QUADRATIC_GRAD_NUC_EPS:
+                    issues.append("zero_weight_nonzero_curvature")
+                if grad_nuc_sum > LOCAL_QUADRATIC_GRAD_NUC_EPS:
+                    issues.append("zero_weight_nonzero_grad_window")
+            if issues:
+                problem_layers.append({
+                    "block_name": name,
+                    "issues": issues,
+                    "w_norm": _safe_float(w_norm),
+                    "m_i": _safe_float(m_by_name[name]),
+                    "L_i_v_h_v": _safe_float(l_i),
+                    "grad_nuclear_norm_window_sum": _safe_float(grad_nuc_sum),
+                })
+        problem_layers.sort(
+            key=lambda layer: (
+                -float(layer["grad_nuclear_norm_window_sum"] or 0.0),
+                layer["block_name"],
+            )
+        )
+        warning_kind = None
+        warning_message = None
+        if zero_over_zero:
+            warning_kind = "criterion_zero_over_zero"
+            warning_message = (
+                "Criterion is 0/0: both lhs and rhs are numerically zero. "
+                "Inspect problem_layers for zero-norm weights carrying curvature or gradient signal."
+            )
+        elif not criterion_valid:
+            warning_kind = "criterion_invalid"
+            warning_message = (
+                "Criterion ratio is invalid because lhs or rhs is non-finite, "
+                "or rhs is numerically zero."
+            )
+        elif problem_layers:
+            warning_kind = "problem_layers_present"
+            warning_message = (
+                "Some layers have zero-norm weights with nonzero curvature or "
+                "gradient-window signal; criterion is finite but should be inspected."
+            )
+        is_all_layer_m = LOCAL_QUADRATIC_GRAD_CRITERION_MODE == "all_layer_m"
+        groups[kind] = {
+            "criterion_mode": LOCAL_QUADRATIC_GRAD_CRITERION_MODE,
+            "criterion_valid": criterion_valid,
+            "zero_over_zero": zero_over_zero,
+            "warning_kind": warning_kind,
+            "warning_message": warning_message,
+            "warning_problem_layer_count": len(problem_layers),
+            "warning_problem_layers": problem_layers,
+            "n_layers": len(layer_blocks),
+            "sum_L": _safe_float(sum_l),
+            "sum_L_m_i": _safe_float(sum_l_m),
+            "sum_L_w_norm_sq": _safe_float(sum_l_w2),
+            "rhs_grad_nuclear_norm_sum": _safe_float(denominator_sum),
+            "rhs_weighted_grad_nuclear_norm_sum": _safe_float(numerator_sum),
+            "lhs": _safe_float(lhs),
+            "lhs_denominator": "sum_i L_i m_i" if is_all_layer_m else "sum_i L_i",
+            "lhs_sum_L_w2_over_sum_L": _safe_float(lhs) if not is_all_layer_m else None,
+            "lhs_sum_L_w2_over_sum_L_m": _safe_float(lhs) if is_all_layer_m else None,
+            "grad_window_step_count": len(valid_window_steps),
+            "grad_window_steps": valid_window_steps,
+            "rhs": _safe_float(rhs),
+            "rhs_numerator": (
+                "E_t sum_i (||W_i||_F / sqrt(m_i)) ||G_i,t||_*"
+                if is_all_layer_m
+                else "E_t sum_i ||W_i||_F ||G_i,t||_*"
+            ),
+            "rhs_denominator": "E_t sum_i ||G_i,t||_*",
+            "rhs_grad_weighted_w_mean_sq": _safe_float(rhs) if not is_all_layer_m else None,
+            "rhs_grad_weighted_w_over_sqrt_m_mean_sq": _safe_float(rhs) if is_all_layer_m else None,
+            "lhs_over_rhs": _safe_float(ratio),
+            "criterion_lhs_le_rhs": bool(criterion_valid and lhs <= rhs),
+            "layers": [
+                {
+                    "block_name": name,
+                    "w_norm": _safe_float(w_by_name[name]),
+                    "m_i": _safe_float(m_by_name[name]),
+                    "L_i_v_h_v": _safe_float(l_by_name[name]),
+                    "grad_nuclear_norm_window_sum": _safe_float(grad_nuc_sum_by_name[name]),
+                }
+                for name in block_names
+            ],
+        }
+
+    return {
+        "center_step": center_step,
+        "criterion_mode": LOCAL_QUADRATIC_GRAD_CRITERION_MODE,
+        "radius": int(LOCAL_QUADRATIC_GRAD_WINDOW_RADIUS),
+        "expected_window_step_count": len(expected_steps),
+        "actual_window_step_count": len(actual_steps),
+        "missing_window_steps": missing_steps,
+        "groups": groups,
+    }
+
+
+def _write_grad_window_outputs(
+    diag_records: list[dict],
+    grad_window_by_center: dict[int, list[dict]],
+    criteria_by_center: dict[int, dict],
+) -> None:
+    if not (dist.get_rank() == 0 and MYOPT_SAVE_DIAG):
+        return
+    if diag_file is not None:
+        _write_json_atomic(diag_file, diag_records)
+    if grad_window_file is not None:
+        raw_records = []
+        for center in sorted(grad_window_by_center):
+            for record in sorted(grad_window_by_center[center], key=lambda r: int(r["step"])):
+                out = dict(record)
+                out["center_step"] = int(center)
+                out["offset_from_center"] = int(record["step"]) - int(center)
+                raw_records.append(out)
+        _write_json_atomic(grad_window_file, raw_records)
+    if grad_window_criteria_file is not None:
+        _write_json_atomic(
+            grad_window_criteria_file,
+            [criteria_by_center[k] for k in sorted(criteria_by_center)],
+        )
+    if grad_window_criteria_csv is not None:
+        with grad_window_criteria_csv.open("w", newline="") as f:
+            fieldnames = [
+                "center_step",
+                "type",
+                "criterion_mode",
+                "n_layers",
+                "sum_L",
+                "sum_L_m_i",
+                "sum_L_w_norm_sq",
+                "rhs_grad_nuclear_norm_sum",
+                "rhs_weighted_grad_nuclear_norm_sum",
+                "lhs",
+                "lhs_sum_L_w2_over_sum_L",
+                "lhs_sum_L_w2_over_sum_L_m",
+                "rhs",
+                "rhs_grad_weighted_w_mean_sq",
+                "rhs_grad_weighted_w_over_sqrt_m_mean_sq",
+                "lhs_over_rhs",
+                "criterion_valid",
+                "zero_over_zero",
+                "criterion_lhs_le_rhs",
+                "warning_kind",
+                "warning_message",
+                "warning_problem_layer_count",
+                "warning_problem_layers",
+                "grad_window_step_count",
+                "expected_window_step_count",
+                "actual_window_step_count",
+            ]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for center in sorted(criteria_by_center):
+                crit = criteria_by_center[center]
+                for kind, group in sorted(crit["groups"].items()):
+                    writer.writerow({
+                        "center_step": center,
+                        "type": kind,
+                        "criterion_mode": group["criterion_mode"],
+                        "n_layers": group["n_layers"],
+                        "sum_L": group["sum_L"],
+                        "sum_L_m_i": group["sum_L_m_i"],
+                        "sum_L_w_norm_sq": group["sum_L_w_norm_sq"],
+                        "rhs_grad_nuclear_norm_sum": group["rhs_grad_nuclear_norm_sum"],
+                        "rhs_weighted_grad_nuclear_norm_sum": group["rhs_weighted_grad_nuclear_norm_sum"],
+                        "lhs": group["lhs"],
+                        "lhs_sum_L_w2_over_sum_L": group["lhs_sum_L_w2_over_sum_L"],
+                        "lhs_sum_L_w2_over_sum_L_m": group["lhs_sum_L_w2_over_sum_L_m"],
+                        "rhs": group["rhs"],
+                        "rhs_grad_weighted_w_mean_sq": group["rhs_grad_weighted_w_mean_sq"],
+                        "rhs_grad_weighted_w_over_sqrt_m_mean_sq": group["rhs_grad_weighted_w_over_sqrt_m_mean_sq"],
+                        "lhs_over_rhs": group["lhs_over_rhs"],
+                        "criterion_valid": group["criterion_valid"],
+                        "zero_over_zero": group["zero_over_zero"],
+                        "criterion_lhs_le_rhs": group["criterion_lhs_le_rhs"],
+                        "warning_kind": group["warning_kind"],
+                        "warning_message": group["warning_message"],
+                        "warning_problem_layer_count": group["warning_problem_layer_count"],
+                        "warning_problem_layers": ";".join(
+                            layer["block_name"] for layer in group["warning_problem_layers"]
+                        ),
+                        "grad_window_step_count": group["grad_window_step_count"],
+                        "expected_window_step_count": crit["expected_window_step_count"],
+                        "actual_window_step_count": crit["actual_window_step_count"],
+                    })
+
+
+for p in model.parameters():
+    dist.broadcast(p.detach(), 0)
+
+########################################
+#         LR schedule                  #
+########################################
+
+def schedule_multiplier(step, cooldown_frac=None):
+    cooldown_frac = MYOPT_COOLDOWN_FRAC if cooldown_frac is None else float(cooldown_frac)
+    progress = step / schedule_steps
+    return 1.0 if progress < 1 - cooldown_frac else (1 - progress) / cooldown_frac
+
+def set_hparams(step, cooldown_frac=None):
+    eta = schedule_multiplier(step, cooldown_frac)
+    for opt in optimizers:
+        for group in opt.param_groups:
+            group["lr"] = group["initial_lr"] * eta
+
+########################################
+#         Training loop                #
+########################################
+
+diag_records: list[dict] = []
+orscale_curvature_cache: dict[str, dict] = {}
+diag_record_by_step: dict[int, dict] = {}
+grad_window_by_center: dict[int, list[dict]] = {}
+grad_window_criteria_by_center: dict[int, dict] = {}
+diag_counter = 0
+train_loader = distributed_data_generator(str(DATA_DIR / "fineweb_train_*.bin"), batch_size)
+training_time = 0.0
+last_val_step = 0
+dist.barrier()
+t0 = time.perf_counter()
+if MYOPT_SAVE_WEIGHT_NORMS:
+    _append_weight_norm_record(
+        0,
+        None,
+        optimizer2.param_groups[0]["lr"],
+        event="init",
+    )
+
+
+def finalize_ready_grad_windows(current_step: int) -> None:
+    if not (dist.get_rank() == 0 and MYOPT_SAVE_DIAG and LOCAL_QUADRATIC_GRAD_WINDOW_ENABLED):
+        return
+    changed = False
+    for center in sorted(grad_window_by_center):
+        if center in grad_window_criteria_by_center:
+            continue
+        if current_step < center + LOCAL_QUADRATIC_GRAD_WINDOW_RADIUS:
+            continue
+        diag_record = diag_record_by_step.get(center)
+        if diag_record is None:
+            continue
+        criterion = _compute_grad_window_criterion(diag_record, grad_window_by_center[center])
+        diag_record["grad_window_criterion"] = criterion
+        grad_window_criteria_by_center[center] = criterion
+        for kind, group in sorted(criterion.get("groups", {}).items()):
+            if group.get("warning_kind"):
+                problem_layers = group.get("warning_problem_layers", [])
+                shown_layers = [layer["block_name"] for layer in problem_layers[:12]]
+                suffix = "" if len(problem_layers) <= 12 else f"; +{len(problem_layers) - 12} more"
+                print0(
+                    "WARNING grad_window_criterion "
+                    f"step:{center} group:{kind} mode:{criterion.get('criterion_mode')} "
+                    f"warning:{group.get('warning_kind')} "
+                    f"valid:{group.get('criterion_valid')} "
+                    f"zero_over_zero:{group.get('zero_over_zero')} "
+                    f"lhs:{group.get('lhs')} rhs:{group.get('rhs')} "
+                    f"problem_layers:{', '.join(shown_layers)}{suffix}",
+                    console=True,
+                )
+        changed = True
+    if changed:
+        _write_grad_window_outputs(
+            diag_records,
+            grad_window_by_center,
+            grad_window_criteria_by_center,
+        )
+
+for step in range(train_steps + 1):
+
+    # -------- validation --------
+    if step >= LATE_VAL_START_STEP:
+        val_step_freq = LATE_VAL_STEP_FREQ
+    elif step >= MID_VAL_START_STEP:
+        val_step_freq = MID_VAL_STEP_FREQ
+    else:
+        val_step_freq = EARLY_VAL_STEP_FREQ
+    if step == train_steps or step % val_step_freq == 0:
+        dist.barrier()
+        time_since_last_val = time.perf_counter() - t0
+        step_avg = time_since_last_val / (step - last_val_step) if step > 0 else float("nan")
+        last_val_step = step
+        training_time += time_since_last_val
+        model.eval()
+        train_model.eval()
+        val_loss = torch.zeros((), device=device)
+        with torch.no_grad():
+            for i in range(len(val_inputs) // train_microbatch_sequences):
+                start = i * train_microbatch_sequences
+                end = (i + 1) * train_microbatch_sequences
+                val_loss += train_model(val_inputs[start:end], val_targets[start:end])
+        dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
+        val_loss_per_tok = float(val_loss) / val_tokens
+        print0(f"step:{step}/{train_steps} val_loss:{val_loss_per_tok:.5f}"
+               f" train_time:{training_time:.3f}s step_avg:{1000*step_avg:.2f}ms", console=True)
+        _append_val_loss_record(
+            step,
+            val_loss_per_tok,
+            training_time,
+            1000 * step_avg,
+        )
+        model.train()
+        train_model.train()
+        dist.barrier()
+        t0 = time.perf_counter()
+
+    if step == train_steps:
+        break
+
+    # -------- training step --------
+    inputs, targets = next(train_loader)
+    assert len(inputs) % train_microbatches == 0
+    current_microbatch_sequences = len(inputs) // train_microbatches
+    assert current_microbatch_sequences == train_microbatch_sequences
+    step_train_loss = 0.0
+    for i in range(train_microbatches):
+        start = i * current_microbatch_sequences
+        end = (i + 1) * current_microbatch_sequences
+        loss = train_model(inputs[start:end], targets[start:end])
+        step_train_loss += loss.item()
+        loss.backward()
+    step_train_loss /= (len(inputs) * sequence_length)  # per token
+
+    for name_p, p in model.named_parameters():
+        assert p.grad is not None, name_p
+        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+    current_step_index = step + 1
+    if LOCAL_QUADRATIC_GRAD_WINDOW_ENABLED:
+        centers = _local_quadratic_grad_window_centers_for_step(current_step_index)
+        if centers and dist.get_rank() == 0:
+            grad_window_record = _collect_grad_nuclear_window_step(current_step_index, centers)
+            for center in centers:
+                grad_window_by_center.setdefault(center, []).append(grad_window_record)
+    set_hparams(step)
+    current_lr = optimizer2.param_groups[0]["lr"]
+
+    # -------- diagnostics every DIAG_FREQ steps (all ranks participate) --------
+    # Measure before optimizer.step so G_diag(W_t) and the Muon direction V_t
+    # are defined at the same checkpoint.
+    if MYOPT_SAVE_DIAG and (step + 1) % DIAG_FREQ == 0:
+        diag_counter += 1
+        if MYOPT_DIAG_MODE == "orscale":
+            record = compute_orscale_diagnostics(
+                model=model,
+                optimizer2=optimizer2,
+                diag_inputs=diag_inputs,
+                diag_targets=diag_targets,
+                train_batch_tokens=batch_size,
+                diag_grad_microbatch_size=diag_grad_mbs,
+                lr_current=current_lr,
+                diag_index=diag_counter,
+                step=step + 1,
+                train_loss=step_train_loss,
+                scheme=MYOPT_SCHEME,
+                seed=FIXED_SEED,
+                ns_steps=MYOPT_NS_STEPS,
+                ggn_microbatch_size=ORSCALE_GGN_MBS,
+                max_blocks=ORSCALE_MAX_BLOCKS,
+                l_estimator=ORSCALE_L_ESTIMATOR,
+                curvature_cache=orscale_curvature_cache,
+                l_init_power_iters=ORSCALE_L_INIT_POWER_ITERS,
+                l_refresh_diag_interval=ORSCALE_L_REFRESH_DIAG_INTERVAL,
+                l_refresh_power_iters=ORSCALE_L_REFRESH_POWER_ITERS,
+                l_blocks_per_diag=ORSCALE_L_BLOCKS_PER_DIAG,
+                l_floor=ORSCALE_L_FLOOR,
+                eps_w=ORSCALE_EPS_W,
+            )
+        else:
+            if LOCAL_QUADRATIC_DATA_SOURCE == "train_batch":
+                local_quadratic_inputs = inputs
+                local_quadratic_targets = targets
+                local_quadratic_data_source = "current_training_batch"
+            else:
+                local_quadratic_inputs = diag_inputs
+                local_quadratic_targets = diag_targets
+                local_quadratic_data_source = "fixed_validation_batch"
+            record = compute_local_quadratic_diagnostics(
+                model=model,
+                optimizer2=optimizer2,
+                diag_inputs=local_quadratic_inputs,
+                diag_targets=local_quadratic_targets,
+                diag_data_source=local_quadratic_data_source,
+                train_batch_tokens=batch_size,
+                diag_grad_microbatch_size=diag_grad_mbs,
+                hvp_microbatch_size=LOCAL_QUADRATIC_HVP_MBS,
+                lr_current=current_lr,
+                diag_index=diag_counter,
+                step=step + 1,
+                train_loss=step_train_loss,
+                scheme=MYOPT_SCHEME,
+                seed=FIXED_SEED,
+                ns_steps=MYOPT_NS_STEPS,
+                max_blocks=LOCAL_QUADRATIC_MAX_BLOCKS,
+                curvature_method=LOCAL_QUADRATIC_CURVATURE_METHOD,
+                fd_probes=LOCAL_QUADRATIC_FD_PROBES,
+                fd_rel_eps=LOCAL_QUADRATIC_FD_REL_EPS,
+                fd_abs_eps=LOCAL_QUADRATIC_FD_ABS_EPS,
+                eps_w=ORSCALE_EPS_W,
+                eps_den=LOCAL_QUADRATIC_EPS_DEN,
+                exact_hvp_eager_diagnostic_model=LOCAL_QUADRATIC_EXACT_HVP_EAGER_DIAG_MODEL,
+                measure_cross_curvature=LOCAL_QUADRATIC_CROSS_CURVATURE,
+                save_cross_curvature_matrix=LOCAL_QUADRATIC_SAVE_CROSS_CURVATURE_MATRIX,
+            )
+        if dist.get_rank() == 0 and MYOPT_SAVE_DIAG:
+            diag_records.append(record)
+            diag_record_by_step[int(record["step"])] = record
+            _write_json_atomic(diag_file, diag_records)
+    finalize_ready_grad_windows(current_step_index)
+
+    for opt in optimizers:
+        opt.step()
+    model.zero_grad(set_to_none=True)
+    if MYOPT_SAVE_WEIGHT_NORMS and current_step_index % MYOPT_WEIGHT_NORM_FREQ == 0:
+        _append_weight_norm_record(
+            current_step_index,
+            step_train_loss,
+            current_lr,
+            event="post_update",
+        )
+    if (
+        MYOPT_SAVE_ORSCALE_STATE
+        and OPT_MODE in (
+            "orscale_general",
+            "orscale_general_decoupled_noclip",
+            "orscale_general_decoupled_clipped",
+        )
+        and current_step_index % MYOPT_ORSCALE_STATE_FREQ == 0
+    ):
+        _append_orscale_state_record(current_step_index, step_train_loss, current_lr)
+
+    approx_time = training_time + (time.perf_counter() - t0)
+    print0(f"step:{step+1}/{train_steps} train_loss:{step_train_loss:.5f}"
+           f" train_time:{approx_time:.3f}s step_avg:{1000*approx_time/(step+1):.2f}ms",
+           console=True, log=False)
+
+finalize_ready_grad_windows(train_steps)
+dist.destroy_process_group()
+
+====================================================================================================
+scheme:plain_muon opt_mode:plain rho:0.0 ns_steps:12 momentum:0.95 nesterov:True scale_ema_beta:0.9 interval:5
+matrix_lr_base:0.035 matrix_weight_decay_base:0.025 weight_decay_mode:decoupled zero_init_trust_floor_scale:1.0
+matrix_group:q/k/v initial_lr:0.025 weight_decay:0.025
+matrix_group:attn.proj initial_lr:0.03 weight_decay:0.025
+matrix_group:mlp.fc initial_lr:0.035 weight_decay:0.0375
+matrix_group:mlp.proj initial_lr:0.035 weight_decay:0.025
+uw_floor_mode:off uw_floor_c:0.0 uw_floor_calibration_step:400 uw_floor_eps:1e-12
+schedule_cooldown_frac:0.7 previous_muonl_experiment_cooldown_frac:0.7
+validation_frequency early:125 mid:25@3000 late:10@3200
+seed:42 train_steps:3300 schedule_steps:3300 diag_freq:250
+batch_tokens:524288 train_microbatches:8 train_microbatch_sequences:64 val_tokens:10485760
+save_log:True save_diag:True save_orscale_state:False orscale_state_freq:250
+save_weight_norms:False weight_norm_freq:1 save_val_loss_jsonl:True
+diag_mode:local_quadratic
+diag_batch_size:64 diag_tokens:65536 diag_grad_mbs:4 local_quadratic_data_source:train_batch
+local_quadratic_train_batch_scope:full_optimizer_step local_quadratic_train_batch_sequences:512 local_quadratic_train_batch_tokens:524288
+orscale_L_estimator:microbatch_fisher_gram L_init_power_iters:3 L_refresh_diag_interval:10 L_refresh_power_iters:1 L_blocks_per_diag:4 ggn_mbs:1 max_blocks:0 L_floor:1e-12 eps_w:1e-12
+local_quadratic_hvp_mbs:4 local_quadratic_max_blocks:0 local_quadratic_eps_den:1e-30 local_quadratic_curvature:exact_hvp local_quadratic_fd_probes:4 local_quadratic_fd_rel_eps:0.001 local_quadratic_fd_abs_eps:0.0001 local_quadratic_cross_curvature:True local_quadratic_save_cross_curvature_matrix:True local_quadratic_donated_buffer_disabled:True
+allow_local_quadratic_muonl:False local_quadratic_grad_window_enabled:False local_quadratic_grad_window_radius:0 local_quadratic_grad_criterion_mode:by_type local_quadratic_grad_nuc_eps:1e-30
+step:S val_loss is after S optimizer updates
+step:0/3300 val_loss:10.82583 train_time:0.000s step_avg:nanms
+step:125/3300 val_loss:4.69587 train_time:201.215s step_avg:1609.72ms
+step:250/3300 val_loss:4.12532 train_time:1488.071s step_avg:10294.85ms
+step:375/3300 val_loss:3.93937 train_time:1640.623s step_avg:1220.42ms
+step:500/3300 val_loss:3.83156 train_time:2920.600s step_avg:10239.82ms
+step:625/3300 val_loss:3.76162 train_time:3073.029s step_avg:1219.43ms
+step:750/3300 val_loss:3.71489 train_time:4347.101s step_avg:10192.57ms
+step:875/3300 val_loss:3.67524 train_time:4499.516s step_avg:1219.32ms
+step:1000/3300 val_loss:3.64108 train_time:5782.972s step_avg:10267.65ms
+step:1125/3300 val_loss:3.61328 train_time:5935.277s step_avg:1218.44ms
+step:1250/3300 val_loss:3.57983 train_time:7213.921s step_avg:10229.15ms
+step:1375/3300 val_loss:3.55398 train_time:7366.128s step_avg:1217.66ms
+step:1500/3300 val_loss:3.52385 train_time:8646.704s step_avg:10244.61ms
+step:1625/3300 val_loss:3.50558 train_time:8798.734s step_avg:1216.24ms
+step:1750/3300 val_loss:3.48333 train_time:10075.483s step_avg:10214.00ms
+step:1875/3300 val_loss:3.46283 train_time:10228.001s step_avg:1220.14ms
+step:2000/3300 val_loss:3.44352 train_time:11507.484s step_avg:10235.86ms
+step:2125/3300 val_loss:3.42556 train_time:11659.719s step_avg:1217.88ms
+step:2250/3300 val_loss:3.40721 train_time:12935.450s step_avg:10205.85ms
+step:2375/3300 val_loss:3.39032 train_time:13087.999s step_avg:1220.40ms
+step:2500/3300 val_loss:3.37364 train_time:14367.371s step_avg:10234.98ms
+step:2625/3300 val_loss:3.35624 train_time:14519.900s step_avg:1220.23ms
+step:2750/3300 val_loss:3.33914 train_time:15801.941s step_avg:10256.33ms
+step:2875/3300 val_loss:3.32293 train_time:15954.535s step_avg:1220.76ms
+step:3000/3300 val_loss:3.30666 train_time:17239.216s step_avg:10277.44ms
+step:3025/3300 val_loss:3.30279 train_time:17269.729s step_avg:1220.52ms
+step:3050/3300 val_loss:3.29977 train_time:17300.381s step_avg:1226.11ms
+step:3075/3300 val_loss:3.29693 train_time:17330.905s step_avg:1220.93ms
+step:3100/3300 val_loss:3.29411 train_time:17361.523s step_avg:1224.72ms
+step:3125/3300 val_loss:3.29154 train_time:17392.061s step_avg:1221.53ms
+step:3150/3300 val_loss:3.28854 train_time:17422.621s step_avg:1222.39ms
+step:3175/3300 val_loss:3.28624 train_time:17453.195s step_avg:1222.98ms
+step:3200/3300 val_loss:3.28392 train_time:17483.738s step_avg:1221.69ms
+step:3210/3300 val_loss:3.28303 train_time:17495.953s step_avg:1221.56ms
+step:3220/3300 val_loss:3.28223 train_time:17508.214s step_avg:1226.11ms
+step:3230/3300 val_loss:3.28153 train_time:17520.422s step_avg:1220.82ms
+step:3240/3300 val_loss:3.28087 train_time:17532.694s step_avg:1227.17ms
+step:3250/3300 val_loss:3.28018 train_time:18673.128s step_avg:114043.42ms
+step:3260/3300 val_loss:3.27963 train_time:18685.324s step_avg:1219.60ms
+step:3270/3300 val_loss:3.27916 train_time:18697.551s step_avg:1222.66ms
+step:3280/3300 val_loss:3.27877 train_time:18709.781s step_avg:1222.98ms
+step:3290/3300 val_loss:3.27849 train_time:18722.058s step_avg:1227.76ms
+step:3300/3300 val_loss:3.27838 train_time:18734.308s step_avg:1224.96ms

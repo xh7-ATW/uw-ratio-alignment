@@ -1,0 +1,11 @@
+launch_time_utc=2026-09-01T20:50:19Z
+job=opt_typed_muonl
+scheme=typed_muonl
+lrwd_mode=opt
+diag_mode=orscale
+save_diag=0
+uw_floor_mode=off
+uw_floor_c=0
+uw_floor_calibration_step=400
+raw_log=../../../../records/track_3_optimization/results/iclr_code/runs/seed42_correct_diag250_cooldown0p7/opt_typed_muonl/raw/seed42_typed_muonl_optlr_loss_only.txt
+command=torchrun --standalone --nproc_per_node=1 ../../../../records/track_3_optimization/results/iclr_code/scripts/train/train_alignment.py 

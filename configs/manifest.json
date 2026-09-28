@@ -1,0 +1,147 @@
+{
+  "schema_version": 1,
+  "claim_groups": [
+    {
+      "name": "shared_lr_main_loss_comparison",
+      "description": "Seed-42 validation-loss comparison among Muon, t-MuonL, and MuonL under the shared learning-rate regime, matching the diagnostic trajectory.",
+      "raw_runs": [
+        "runs/shared_lr/seed42_main"
+      ],
+      "analysis_scripts": [
+        "pipeline/plot_figures/shared_lr_seed42_loss.py"
+      ],
+      "figures": [
+        "figures/shared_lr_seed42_loss.png"
+      ]
+    },
+    {
+      "name": "shared_lr_random5_loss_comparison",
+      "description": "Five-seed validation-loss comparison among Muon, t-MuonL, and MuonL under the shared learning-rate regime.",
+      "configs": [
+        "configs/random5_shared_lr_plain_muon.json",
+        "configs/random5_shared_lr_tmuonl.json",
+        "configs/random5_shared_lr_muonl.json"
+      ],
+      "raw_runs": [
+        "runs/shared_lr/random5_main"
+      ],
+      "analysis_scripts": [
+        "pipeline/plot_figures/shared_lr_random5_loss.py"
+      ],
+      "figures": [
+        "figures/shared_lr_random5_loss.png"
+      ]
+    },
+    {
+      "name": "type_specific_lr_loss_and_diagnostics",
+      "description": "Type-specific learning-rate comparison and exact-HVP diagnostic evidence for Muon versus t-MuonL.",
+      "configs": [
+        "configs/seed42_type_lr_muon_diag.json",
+        "configs/seed42_type_lr_tmuonl.json",
+        "configs/random5_type_lr_plain_muon.json",
+        "configs/random5_type_lr_tmuonl.json"
+      ],
+      "raw_runs": [
+        "runs/type_lr/seed42_diag",
+        "runs/type_lr/random5_muon_vs_tmuonl"
+      ],
+      "analysis_scripts": [
+        "pipeline/analysis/type_lr_diagnostics.py",
+        "pipeline/plot_figures/type_lr_seed42.py",
+        "pipeline/plot_figures/type_lr_assumptions.py",
+        "pipeline/plot_figures/type_lr_loss.py"
+      ],
+      "figures": [
+        "figures/type_lr_seed42_loss.png",
+        "figures/type_lr_random5_loss.png",
+        "figures/type_lr_prop2.png",
+        "figures/type_lr_within_type_sum.png",
+        "figures/shared_lr_assumptions.png",
+        "figures/type_lr_assumptions.png"
+      ]
+    },
+    {
+      "name": "shared_lr_u_w_floor_ablation",
+      "description": "Weight-decay-free u-w floor experiments: the random-five Muon loss ablation and the benchmark #9 NorMuon-lite Figure 1b reproduction.",
+      "configs": [
+        "configs/seed42_uw_floor_u_over_w.json",
+        "configs/random5_uw_floor_c035.json"
+      ],
+      "raw_runs": [
+        "runs/uw_floor/random5_c035",
+        "runs/uw_floor/seed42_c035_u_over_w"
+      ],
+      "analysis_scripts": [
+        "pipeline/plot_figures/uw_floor_loss.py",
+        "pipeline/plot_figures/uw_floor_u_over_w.py"
+      ],
+      "figures": [
+        "figures/uw_floor_loss.png",
+        "figures/uw_floor_u_over_w.png"
+      ]
+    },
+    {
+      "name": "benchmark_significance",
+      "description": "Our 15-trial shared-learning-rate MuonL benchmark run evaluated against the 3.28 target loss.",
+      "raw_runs": [
+        "runs/benchmark"
+      ],
+      "analysis_scripts": [
+        "pipeline/analysis/benchmark_significance.py"
+      ]
+    },
+    {
+      "name": "benchmark_u_w_performance",
+      "description": "External benchmark tail validation-loss comparison for u-w floor versus weight-decay controls.",
+      "raw_runs": [
+        "reference_results/benchmark_9_normuon_u_w_floor",
+        "reference_results/benchmark_10_normuon_weight_decay",
+        "reference_results/benchmark_30_projection_pruning"
+      ],
+      "analysis_scripts": [
+        "pipeline/plot_figures/benchmark_u_w_performance.py"
+      ],
+      "figures": [
+        "figures/benchmark_u_w_performance.png"
+      ]
+    },
+    {
+      "name": "shape_scaling_and_score_diagnostics",
+      "description": "Diagnostic figures for shape-scaling violations, score ratios, and shared-learning-rate MuonL criterion decompositions.",
+      "raw_runs": [
+        "runs/shared_lr/seed42_diagnostics",
+        "runs/type_lr/seed42_diag"
+      ],
+      "analysis_scripts": [
+        "pipeline/plot_figures/shape_scaling.py",
+        "pipeline/plot_figures/criteria.py"
+      ],
+      "figures": [
+        "figures/shared_lr_score_ratios.png",
+        "figures/shared_lr_criterion_margin.png",
+        "figures/t_muon_l_shape_scaling.png",
+        "figures/muon_l_shape_scaling.png"
+      ]
+    },
+    {
+      "name": "weight_dynamics",
+      "description": "Per-type mean weight-norm trajectories comparing MuonL, decoupled-OrScale, and OrScale, with config-driven retraining support.",
+      "configs": [
+        "configs/seed42_weight_dynamics_muonl.json",
+        "configs/seed42_weight_dynamics_decoupled_orscale.json",
+        "configs/seed42_weight_dynamics_orscale.json"
+      ],
+      "raw_runs": [
+        "runs/weight_dynamics/muonl",
+        "runs/weight_dynamics/decoupled_orscale",
+        "runs/weight_dynamics/orscale"
+      ],
+      "analysis_scripts": [
+        "pipeline/plot_figures/weight_dynamics.py"
+      ],
+      "figures": [
+        "figures/weight_dynamics.png"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "experiment_name": "random5_shared_lr_muonl",
+  "description": "Five-seed shared-LR MuonL loss runs.",
+  "seeds": [161317530, 1490436515, 1391286422, 1892922382, 681062724],
+  "default_run_dir": "outputs/random5_shared_lr/alllayer_muonl",
+  "log_stem": "seed{seed}_alllayer_muonl_shared_lr",
+  "training": {"script": "pipeline/train/train_alignment.py", "torchrun": "torchrun", "nproc_per_node": 1},
+  "environment": {
+    "MYOPT_SCHEME": "alllayer_muonl", "MYOPT_SAVE_LOG": "1", "MYOPT_SAVE_DIAG": "0",
+    "MYOPT_SAVE_VAL_LOSS_JSONL": "1", "MYOPT_LR": "0.035", "MYOPT_WD": "0.025",
+    "MYOPT_COOLDOWN_FRAC": "0.7", "MYOPT_TRAIN_STEPS": "3300", "MYOPT_SCHEDULE_STEPS": "3300",
+    "MYOPT_VAL_TOKENS": "10485760", "MYOPT_MID_VAL_FREQ": "25", "MYOPT_MID_VAL_START": "3000",
+    "MYOPT_LATE_VAL_FREQ": "10", "MYOPT_LATE_VAL_START": "3200", "MYOPT_UW_FLOOR_MODE": "off"
+  }
+}

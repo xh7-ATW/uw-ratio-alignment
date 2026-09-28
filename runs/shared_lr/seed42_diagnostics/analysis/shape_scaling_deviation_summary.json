@@ -1,0 +1,22 @@
+{
+  "all_layer": {
+    "averaged_max_abs_percentage_deviation": 16.607819280401877,
+    "averaged_median_abs_percentage_deviation": 10.365559109039888,
+    "block_counts_per_type_step": [
+      12
+    ],
+    "method": "MuonL",
+    "statistic": "mean over diagnostic-step/type summaries; each summary is computed across the 12 blocks of that matrix type",
+    "type_step_count": 78
+  },
+  "typed": {
+    "averaged_max_abs_percentage_deviation": 12.883510540297982,
+    "averaged_median_abs_percentage_deviation": 5.255377363207716,
+    "block_counts_per_type_step": [
+      12
+    ],
+    "method": "t-MuonL",
+    "statistic": "mean over diagnostic-step/type summaries; each summary is computed across the 12 blocks of that matrix type",
+    "type_step_count": 78
+  }
+}

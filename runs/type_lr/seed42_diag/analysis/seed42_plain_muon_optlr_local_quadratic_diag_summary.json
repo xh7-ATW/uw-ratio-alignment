@@ -1,0 +1,92 @@
+{
+  "criterion_counts": {
+    "global|all_layer|exact_true": 12,
+    "global|all_layer|sufficient_true": 11,
+    "global|all_layer|total": 13,
+    "global|plain_control|total": 13,
+    "global|typed_aggregate|exact_true": 13,
+    "global|typed_aggregate|sufficient_true": 13,
+    "global|typed_aggregate|total": 13,
+    "type:attn_k|typed_by_type|exact_true": 6,
+    "type:attn_k|typed_by_type|sufficient_true": 6,
+    "type:attn_k|typed_by_type|total": 13,
+    "type:attn_proj|typed_by_type|exact_true": 13,
+    "type:attn_proj|typed_by_type|sufficient_true": 13,
+    "type:attn_proj|typed_by_type|total": 13,
+    "type:attn_q|typed_by_type|exact_true": 7,
+    "type:attn_q|typed_by_type|sufficient_true": 7,
+    "type:attn_q|typed_by_type|total": 13,
+    "type:attn_v|typed_by_type|exact_true": 12,
+    "type:attn_v|typed_by_type|sufficient_true": 11,
+    "type:attn_v|typed_by_type|total": 13,
+    "type:mlp_fc|typed_by_type|exact_true": 8,
+    "type:mlp_fc|typed_by_type|sufficient_true": 8,
+    "type:mlp_fc|typed_by_type|total": 13,
+    "type:mlp_proj|typed_by_type|exact_true": 11,
+    "type:mlp_proj|typed_by_type|sufficient_true": 11,
+    "type:mlp_proj|typed_by_type|total": 13
+  },
+  "diag_data_source": "current_training_batch",
+  "formulas": {
+    "C_ij": "<V_i,H_ij V_j>",
+    "base_lr_score": "when score_lr_policy=base_lr, x_i is multiplied by each block's diagnostic base_lr, not scheduled lr_current",
+    "condition": "lhs > Var(x_i/r_i normalized)",
+    "exact_lhs": "2*c1 + c1^2 - c2",
+    "ltilde_i": "C_ii + sum_{j!=i} 2*r_j*x_j*w_j/(w_i*(r_i*x_j+r_j*x_i))*C_ij",
+    "muon_norm_convention": "r_i = sqrt(m_i)/||W_i||_F; saved finite-NS vi_raw_norm is not used in criteria",
+    "score": "(sum_i x_i*w_i*<G_i,V_i>)^2 / (2 * sum_ij x_i*x_j*w_i*w_j*C_ij)",
+    "score_lr_policy": "unit",
+    "sufficient_lhs": "2*c1 - c2",
+    "weights": "(r_i*w_i)^2 = m_i under the Muon-specific ideal norm convention"
+  },
+  "hvp": {
+    "cross_curvature_enabled": true,
+    "cross_curvature_quantity": "C_ij = <V_i, H_ij V_j>",
+    "curvature_method": "exact_hvp",
+    "exact_hvp_eager_diagnostic_model": true,
+    "fd_abs_eps": 0.0001,
+    "fd_probe_count": 0,
+    "fd_probe_losses": [],
+    "fd_rel_eps": 0.001,
+    "microbatch_size": 4,
+    "operator": "exact_block_hessian_of_diagnostic_per_token_loss",
+    "sdpa_backend": "math",
+    "second_order_quantity": "<V_i,H_ii V_i>",
+    "weighted_adjusted_curvature_definitions": {
+      "all": "tilde_L_i = C_ii + sum_{j!=i} 2 sqrt(m_j/m_i) (||W_j||_F/sqrt(m_j)) / ((||W_i||_F/sqrt(m_i))+(||W_j||_F/sqrt(m_j))) C_ij",
+      "typed": "tilde_L_i = C_ii + sum_{j same type, j!=i} 2||W_j||_F/(||W_i||_F+||W_j||_F) C_ij"
+    }
+  },
+  "input_diag": "runs/type_lr/seed42_diag/muon_diagnostics/raw/seed42_plain_muon_optlr_local_quadratic_diag.json",
+  "optimizer": "plain_muon",
+  "outputs": {
+    "block_theory_terms_csv": "runs/type_lr/seed42_diag/analysis/seed42_plain_muon_optlr_local_quadratic_diag_block_theory_terms.csv",
+    "scores_csv": "runs/type_lr/seed42_diag/analysis/seed42_plain_muon_optlr_local_quadratic_diag_scores.csv",
+    "sufficient_criteria_csv": "runs/type_lr/seed42_diag/analysis/seed42_plain_muon_optlr_local_quadratic_diag_sufficient_criteria.csv",
+    "summary_json": "runs/type_lr/seed42_diag/analysis/seed42_plain_muon_optlr_local_quadratic_diag_summary.json",
+    "uw_ratio_by_type_csv": "runs/type_lr/seed42_diag/analysis/seed42_plain_muon_optlr_local_quadratic_diag_uw_ratio_by_type.csv"
+  },
+  "record_count": 13,
+  "score_counts": {
+    "all_layer_gt_plain": 12,
+    "typed_gt_plain": 13,
+    "winner:all_layer": 10,
+    "winner:typed": 3
+  },
+  "seed": 42,
+  "steps": [
+    250,
+    500,
+    750,
+    1000,
+    1250,
+    1500,
+    1750,
+    2000,
+    2250,
+    2500,
+    2750,
+    3000,
+    3250
+  ]
+}

@@ -1,0 +1,1650 @@
+[
+  {
+    "logfile": "../../../../records/track_3_optimization/results/muonl_benchmark_results/0ea3351a-af71-4ac4-a998-6aacef3ab6c7.txt",
+    "trial_idx": 0,
+    "trial_id": "0ea3351a-af71-4ac4-a998-6aacef3ab6c7",
+    "seed": 1062404007,
+    "train_steps": 3300,
+    "configuration_reference": "Track 3 result #12 Muon optimizer hyperparameters: all transformer matrix weights use lr=0.035, weight_decay=0.025; aux AdamW uses embed lr=0.3, proj lr=1/320, 1D lr=0.01, betas=(0.8,0.95), eps=1e-10, weight_decay=0. This runner intentionally keeps train_steps=3300 and dense tail validation.",
+    "validation": {
+      "early_frequency": 125,
+      "mid_frequency": 25,
+      "mid_start_step": 3000,
+      "late_frequency": 10,
+      "late_start_step": 3200,
+      "data": "../../../../data/fineweb10B/fineweb_val_*.bin",
+      "val_tokens": 10485760
+    },
+    "batch_size_tokens": 524288,
+    "microbatch_sequences": 64,
+    "optimizer": {
+      "name": "DistributedMuonLAllLayer",
+      "mode": "alllayer",
+      "rho": 1.0,
+      "interval": 5,
+      "ns_steps": 12,
+      "ns_coefficients": "newton_muon:a=2,b=-1.5,c=0.5",
+      "momentum": 0.95,
+      "nesterov": true,
+      "scale_ema_beta": 0.9,
+      "qkv_handling": "same_param_group_no_special_kind",
+      "shape_scaling": "sqrt(max(1, rows / cols))",
+      "alllayer_ratio_policy": "relative_scale=EMA((||W||_F/||U||_F)/mean_all_nonzero(||W||_F/||U||_F)); zero-weight matrices use relative_scale=1",
+      "groups": [
+        {
+          "name": "q/k/v",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 36,
+          "num_params": 21233664,
+          "matrix_kinds": {
+            "attn_k": 12,
+            "attn_q": 12,
+            "attn_v": 12
+          },
+          "zero_init_tensors": 0
+        },
+        {
+          "name": "attn.proj",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 7077888,
+          "matrix_kinds": {
+            "attn_proj": 12
+          },
+          "zero_init_tensors": 12
+        },
+        {
+          "name": "mlp.fc",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 28311552,
+          "matrix_kinds": {
+            "mlp_fc": 12
+          },
+          "zero_init_tensors": 0
+        },
+        {
+          "name": "mlp.proj",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 28311552,
+          "matrix_kinds": {
+            "mlp_proj": 12
+          },
+          "zero_init_tensors": 12
+        }
+      ]
+    },
+    "aux_adamw": {
+      "betas": [
+        0.8,
+        0.95
+      ],
+      "eps": 1e-10,
+      "weight_decay": 0,
+      "groups": [
+        {
+          "lr": 0.3,
+          "num_params": 38633472
+        },
+        {
+          "lr": 0.003125,
+          "num_params": 38633472
+        },
+        {
+          "lr": 0.01,
+          "num_params": 153216
+        }
+      ]
+    }
+  },
+  {
+    "logfile": "../../../../records/track_3_optimization/results/muonl_benchmark_results/b5d7e3b6-fde8-4e40-847c-dca68831c45a.txt",
+    "trial_idx": 1,
+    "trial_id": "b5d7e3b6-fde8-4e40-847c-dca68831c45a",
+    "seed": 1552050029,
+    "train_steps": 3300,
+    "configuration_reference": "Track 3 result #12 Muon optimizer hyperparameters: all transformer matrix weights use lr=0.035, weight_decay=0.025; aux AdamW uses embed lr=0.3, proj lr=1/320, 1D lr=0.01, betas=(0.8,0.95), eps=1e-10, weight_decay=0. This runner intentionally keeps train_steps=3300 and dense tail validation.",
+    "validation": {
+      "early_frequency": 125,
+      "mid_frequency": 25,
+      "mid_start_step": 3000,
+      "late_frequency": 10,
+      "late_start_step": 3200,
+      "data": "../../../../data/fineweb10B/fineweb_val_*.bin",
+      "val_tokens": 10485760
+    },
+    "batch_size_tokens": 524288,
+    "microbatch_sequences": 64,
+    "optimizer": {
+      "name": "DistributedMuonLAllLayer",
+      "mode": "alllayer",
+      "rho": 1.0,
+      "interval": 5,
+      "ns_steps": 12,
+      "ns_coefficients": "newton_muon:a=2,b=-1.5,c=0.5",
+      "momentum": 0.95,
+      "nesterov": true,
+      "scale_ema_beta": 0.9,
+      "qkv_handling": "same_param_group_no_special_kind",
+      "shape_scaling": "sqrt(max(1, rows / cols))",
+      "alllayer_ratio_policy": "relative_scale=EMA((||W||_F/||U||_F)/mean_all_nonzero(||W||_F/||U||_F)); zero-weight matrices use relative_scale=1",
+      "groups": [
+        {
+          "name": "q/k/v",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 36,
+          "num_params": 21233664,
+          "matrix_kinds": {
+            "attn_k": 12,
+            "attn_q": 12,
+            "attn_v": 12
+          },
+          "zero_init_tensors": 0
+        },
+        {
+          "name": "attn.proj",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 7077888,
+          "matrix_kinds": {
+            "attn_proj": 12
+          },
+          "zero_init_tensors": 12
+        },
+        {
+          "name": "mlp.fc",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 28311552,
+          "matrix_kinds": {
+            "mlp_fc": 12
+          },
+          "zero_init_tensors": 0
+        },
+        {
+          "name": "mlp.proj",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 28311552,
+          "matrix_kinds": {
+            "mlp_proj": 12
+          },
+          "zero_init_tensors": 12
+        }
+      ]
+    },
+    "aux_adamw": {
+      "betas": [
+        0.8,
+        0.95
+      ],
+      "eps": 1e-10,
+      "weight_decay": 0,
+      "groups": [
+        {
+          "lr": 0.3,
+          "num_params": 38633472
+        },
+        {
+          "lr": 0.003125,
+          "num_params": 38633472
+        },
+        {
+          "lr": 0.01,
+          "num_params": 153216
+        }
+      ]
+    }
+  },
+  {
+    "logfile": "../../../../records/track_3_optimization/results/muonl_br_sharedlr_H100/930118ad-fc41-4c1e-8bf5-7ce1833da5c5.txt",
+    "trial_idx": 0,
+    "trial_id": "930118ad-fc41-4c1e-8bf5-7ce1833da5c5",
+    "seed": 1712982510,
+    "train_steps": 3300,
+    "configuration_reference": "Track 3 result #12 Muon optimizer hyperparameters: all transformer matrix weights use lr=0.035, weight_decay=0.025; aux AdamW uses embed lr=0.3, proj lr=1/320, 1D lr=0.01, betas=(0.8,0.95), eps=1e-10, weight_decay=0. This runner intentionally keeps train_steps=3300 and dense tail validation.",
+    "validation": {
+      "early_frequency": 125,
+      "mid_frequency": 25,
+      "mid_start_step": 3000,
+      "late_frequency": 10,
+      "late_start_step": 3200,
+      "data": "../../../../data/fineweb10B/fineweb_val_*.bin",
+      "val_tokens": 10485760
+    },
+    "batch_size_tokens": 524288,
+    "microbatch_sequences": 64,
+    "optimizer": {
+      "name": "DistributedMuonLAllLayer",
+      "mode": "alllayer",
+      "rho": 1.0,
+      "interval": 5,
+      "ns_steps": 12,
+      "ns_coefficients": "newton_muon:a=2,b=-1.5,c=0.5",
+      "momentum": 0.95,
+      "nesterov": true,
+      "scale_ema_beta": 0.9,
+      "qkv_handling": "same_param_group_no_special_kind",
+      "shape_scaling": "sqrt(max(1, rows / cols))",
+      "alllayer_ratio_policy": "relative_scale=EMA((||W||_F/||U||_F)/mean_all_nonzero(||W||_F/||U||_F)); zero-weight matrices use relative_scale=1",
+      "groups": [
+        {
+          "name": "q/k/v",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 36,
+          "num_params": 21233664,
+          "matrix_kinds": {
+            "attn_k": 12,
+            "attn_q": 12,
+            "attn_v": 12
+          },
+          "zero_init_tensors": 0
+        },
+        {
+          "name": "attn.proj",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 7077888,
+          "matrix_kinds": {
+            "attn_proj": 12
+          },
+          "zero_init_tensors": 12
+        },
+        {
+          "name": "mlp.fc",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 28311552,
+          "matrix_kinds": {
+            "mlp_fc": 12
+          },
+          "zero_init_tensors": 0
+        },
+        {
+          "name": "mlp.proj",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 28311552,
+          "matrix_kinds": {
+            "mlp_proj": 12
+          },
+          "zero_init_tensors": 12
+        }
+      ]
+    },
+    "aux_adamw": {
+      "betas": [
+        0.8,
+        0.95
+      ],
+      "eps": 1e-10,
+      "weight_decay": 0,
+      "groups": [
+        {
+          "lr": 0.3,
+          "num_params": 38633472
+        },
+        {
+          "lr": 0.003125,
+          "num_params": 38633472
+        },
+        {
+          "lr": 0.01,
+          "num_params": 153216
+        }
+      ]
+    }
+  },
+  {
+    "logfile": "../../../../records/track_3_optimization/results/muonl_br_sharedlr_H100/697aad9b-91a7-4894-9ffa-4b4cba205538.txt",
+    "trial_idx": 1,
+    "trial_id": "697aad9b-91a7-4894-9ffa-4b4cba205538",
+    "seed": 1842369613,
+    "train_steps": 3300,
+    "configuration_reference": "Track 3 result #12 Muon optimizer hyperparameters: all transformer matrix weights use lr=0.035, weight_decay=0.025; aux AdamW uses embed lr=0.3, proj lr=1/320, 1D lr=0.01, betas=(0.8,0.95), eps=1e-10, weight_decay=0. This runner intentionally keeps train_steps=3300 and dense tail validation.",
+    "validation": {
+      "early_frequency": 125,
+      "mid_frequency": 25,
+      "mid_start_step": 3000,
+      "late_frequency": 10,
+      "late_start_step": 3200,
+      "data": "../../../../data/fineweb10B/fineweb_val_*.bin",
+      "val_tokens": 10485760
+    },
+    "batch_size_tokens": 524288,
+    "microbatch_sequences": 64,
+    "optimizer": {
+      "name": "DistributedMuonLAllLayer",
+      "mode": "alllayer",
+      "rho": 1.0,
+      "interval": 5,
+      "ns_steps": 12,
+      "ns_coefficients": "newton_muon:a=2,b=-1.5,c=0.5",
+      "momentum": 0.95,
+      "nesterov": true,
+      "scale_ema_beta": 0.9,
+      "qkv_handling": "same_param_group_no_special_kind",
+      "shape_scaling": "sqrt(max(1, rows / cols))",
+      "alllayer_ratio_policy": "relative_scale=EMA((||W||_F/||U||_F)/mean_all_nonzero(||W||_F/||U||_F)); zero-weight matrices use relative_scale=1",
+      "groups": [
+        {
+          "name": "q/k/v",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 36,
+          "num_params": 21233664,
+          "matrix_kinds": {
+            "attn_k": 12,
+            "attn_q": 12,
+            "attn_v": 12
+          },
+          "zero_init_tensors": 0
+        },
+        {
+          "name": "attn.proj",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 7077888,
+          "matrix_kinds": {
+            "attn_proj": 12
+          },
+          "zero_init_tensors": 12
+        },
+        {
+          "name": "mlp.fc",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 28311552,
+          "matrix_kinds": {
+            "mlp_fc": 12
+          },
+          "zero_init_tensors": 0
+        },
+        {
+          "name": "mlp.proj",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 28311552,
+          "matrix_kinds": {
+            "mlp_proj": 12
+          },
+          "zero_init_tensors": 12
+        }
+      ]
+    },
+    "aux_adamw": {
+      "betas": [
+        0.8,
+        0.95
+      ],
+      "eps": 1e-10,
+      "weight_decay": 0,
+      "groups": [
+        {
+          "lr": 0.3,
+          "num_params": 38633472
+        },
+        {
+          "lr": 0.003125,
+          "num_params": 38633472
+        },
+        {
+          "lr": 0.01,
+          "num_params": 153216
+        }
+      ]
+    }
+  },
+  {
+    "logfile": "../../../../records/track_3_optimization/results/muonl_br_sharedlr_H100/1c901a80-8871-4381-b9b0-12da813eaa7b.txt",
+    "trial_idx": 2,
+    "trial_id": "1c901a80-8871-4381-b9b0-12da813eaa7b",
+    "seed": 1493257163,
+    "train_steps": 3300,
+    "configuration_reference": "Track 3 result #12 Muon optimizer hyperparameters: all transformer matrix weights use lr=0.035, weight_decay=0.025; aux AdamW uses embed lr=0.3, proj lr=1/320, 1D lr=0.01, betas=(0.8,0.95), eps=1e-10, weight_decay=0. This runner intentionally keeps train_steps=3300 and dense tail validation.",
+    "validation": {
+      "early_frequency": 125,
+      "mid_frequency": 25,
+      "mid_start_step": 3000,
+      "late_frequency": 10,
+      "late_start_step": 3200,
+      "data": "../../../../data/fineweb10B/fineweb_val_*.bin",
+      "val_tokens": 10485760
+    },
+    "batch_size_tokens": 524288,
+    "microbatch_sequences": 64,
+    "optimizer": {
+      "name": "DistributedMuonLAllLayer",
+      "mode": "alllayer",
+      "rho": 1.0,
+      "interval": 5,
+      "ns_steps": 12,
+      "ns_coefficients": "newton_muon:a=2,b=-1.5,c=0.5",
+      "momentum": 0.95,
+      "nesterov": true,
+      "scale_ema_beta": 0.9,
+      "qkv_handling": "same_param_group_no_special_kind",
+      "shape_scaling": "sqrt(max(1, rows / cols))",
+      "alllayer_ratio_policy": "relative_scale=EMA((||W||_F/||U||_F)/mean_all_nonzero(||W||_F/||U||_F)); zero-weight matrices use relative_scale=1",
+      "groups": [
+        {
+          "name": "q/k/v",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 36,
+          "num_params": 21233664,
+          "matrix_kinds": {
+            "attn_k": 12,
+            "attn_q": 12,
+            "attn_v": 12
+          },
+          "zero_init_tensors": 0
+        },
+        {
+          "name": "attn.proj",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 7077888,
+          "matrix_kinds": {
+            "attn_proj": 12
+          },
+          "zero_init_tensors": 12
+        },
+        {
+          "name": "mlp.fc",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 28311552,
+          "matrix_kinds": {
+            "mlp_fc": 12
+          },
+          "zero_init_tensors": 0
+        },
+        {
+          "name": "mlp.proj",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 28311552,
+          "matrix_kinds": {
+            "mlp_proj": 12
+          },
+          "zero_init_tensors": 12
+        }
+      ]
+    },
+    "aux_adamw": {
+      "betas": [
+        0.8,
+        0.95
+      ],
+      "eps": 1e-10,
+      "weight_decay": 0,
+      "groups": [
+        {
+          "lr": 0.3,
+          "num_params": 38633472
+        },
+        {
+          "lr": 0.003125,
+          "num_params": 38633472
+        },
+        {
+          "lr": 0.01,
+          "num_params": 153216
+        }
+      ]
+    }
+  },
+  {
+    "logfile": "../../../../records/track_3_optimization/results/muonl_br_sharedlr_H100/9556e3f2-6e7e-43d3-9758-3e93f58e3f68.txt",
+    "trial_idx": 3,
+    "trial_id": "9556e3f2-6e7e-43d3-9758-3e93f58e3f68",
+    "seed": 777106698,
+    "train_steps": 3300,
+    "configuration_reference": "Track 3 result #12 Muon optimizer hyperparameters: all transformer matrix weights use lr=0.035, weight_decay=0.025; aux AdamW uses embed lr=0.3, proj lr=1/320, 1D lr=0.01, betas=(0.8,0.95), eps=1e-10, weight_decay=0. This runner intentionally keeps train_steps=3300 and dense tail validation.",
+    "validation": {
+      "early_frequency": 125,
+      "mid_frequency": 25,
+      "mid_start_step": 3000,
+      "late_frequency": 10,
+      "late_start_step": 3200,
+      "data": "../../../../data/fineweb10B/fineweb_val_*.bin",
+      "val_tokens": 10485760
+    },
+    "batch_size_tokens": 524288,
+    "microbatch_sequences": 64,
+    "optimizer": {
+      "name": "DistributedMuonLAllLayer",
+      "mode": "alllayer",
+      "rho": 1.0,
+      "interval": 5,
+      "ns_steps": 12,
+      "ns_coefficients": "newton_muon:a=2,b=-1.5,c=0.5",
+      "momentum": 0.95,
+      "nesterov": true,
+      "scale_ema_beta": 0.9,
+      "qkv_handling": "same_param_group_no_special_kind",
+      "shape_scaling": "sqrt(max(1, rows / cols))",
+      "alllayer_ratio_policy": "relative_scale=EMA((||W||_F/||U||_F)/mean_all_nonzero(||W||_F/||U||_F)); zero-weight matrices use relative_scale=1",
+      "groups": [
+        {
+          "name": "q/k/v",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 36,
+          "num_params": 21233664,
+          "matrix_kinds": {
+            "attn_k": 12,
+            "attn_q": 12,
+            "attn_v": 12
+          },
+          "zero_init_tensors": 0
+        },
+        {
+          "name": "attn.proj",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 7077888,
+          "matrix_kinds": {
+            "attn_proj": 12
+          },
+          "zero_init_tensors": 12
+        },
+        {
+          "name": "mlp.fc",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 28311552,
+          "matrix_kinds": {
+            "mlp_fc": 12
+          },
+          "zero_init_tensors": 0
+        },
+        {
+          "name": "mlp.proj",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 28311552,
+          "matrix_kinds": {
+            "mlp_proj": 12
+          },
+          "zero_init_tensors": 12
+        }
+      ]
+    },
+    "aux_adamw": {
+      "betas": [
+        0.8,
+        0.95
+      ],
+      "eps": 1e-10,
+      "weight_decay": 0,
+      "groups": [
+        {
+          "lr": 0.3,
+          "num_params": 38633472
+        },
+        {
+          "lr": 0.003125,
+          "num_params": 38633472
+        },
+        {
+          "lr": 0.01,
+          "num_params": 153216
+        }
+      ]
+    }
+  },
+  {
+    "logfile": "../../../../records/track_3_optimization/results/muonl_br_sharedlr_H100/4269c899-2a40-4cc3-ab87-25e834d91e67.txt",
+    "trial_idx": 4,
+    "trial_id": "4269c899-2a40-4cc3-ab87-25e834d91e67",
+    "seed": 1193417899,
+    "train_steps": 3300,
+    "configuration_reference": "Track 3 result #12 Muon optimizer hyperparameters: all transformer matrix weights use lr=0.035, weight_decay=0.025; aux AdamW uses embed lr=0.3, proj lr=1/320, 1D lr=0.01, betas=(0.8,0.95), eps=1e-10, weight_decay=0. This runner intentionally keeps train_steps=3300 and dense tail validation.",
+    "validation": {
+      "early_frequency": 125,
+      "mid_frequency": 25,
+      "mid_start_step": 3000,
+      "late_frequency": 10,
+      "late_start_step": 3200,
+      "data": "../../../../data/fineweb10B/fineweb_val_*.bin",
+      "val_tokens": 10485760
+    },
+    "batch_size_tokens": 524288,
+    "microbatch_sequences": 64,
+    "optimizer": {
+      "name": "DistributedMuonLAllLayer",
+      "mode": "alllayer",
+      "rho": 1.0,
+      "interval": 5,
+      "ns_steps": 12,
+      "ns_coefficients": "newton_muon:a=2,b=-1.5,c=0.5",
+      "momentum": 0.95,
+      "nesterov": true,
+      "scale_ema_beta": 0.9,
+      "qkv_handling": "same_param_group_no_special_kind",
+      "shape_scaling": "sqrt(max(1, rows / cols))",
+      "alllayer_ratio_policy": "relative_scale=EMA((||W||_F/||U||_F)/mean_all_nonzero(||W||_F/||U||_F)); zero-weight matrices use relative_scale=1",
+      "groups": [
+        {
+          "name": "q/k/v",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 36,
+          "num_params": 21233664,
+          "matrix_kinds": {
+            "attn_k": 12,
+            "attn_q": 12,
+            "attn_v": 12
+          },
+          "zero_init_tensors": 0
+        },
+        {
+          "name": "attn.proj",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 7077888,
+          "matrix_kinds": {
+            "attn_proj": 12
+          },
+          "zero_init_tensors": 12
+        },
+        {
+          "name": "mlp.fc",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 28311552,
+          "matrix_kinds": {
+            "mlp_fc": 12
+          },
+          "zero_init_tensors": 0
+        },
+        {
+          "name": "mlp.proj",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 28311552,
+          "matrix_kinds": {
+            "mlp_proj": 12
+          },
+          "zero_init_tensors": 12
+        }
+      ]
+    },
+    "aux_adamw": {
+      "betas": [
+        0.8,
+        0.95
+      ],
+      "eps": 1e-10,
+      "weight_decay": 0,
+      "groups": [
+        {
+          "lr": 0.3,
+          "num_params": 38633472
+        },
+        {
+          "lr": 0.003125,
+          "num_params": 38633472
+        },
+        {
+          "lr": 0.01,
+          "num_params": 153216
+        }
+      ]
+    }
+  },
+  {
+    "logfile": "../../../../records/track_3_optimization/results/muonl_br_sharedlr_H100/fa41da1d-2fa0-4c70-8cf7-ae18a055b298.txt",
+    "trial_idx": 5,
+    "trial_id": "fa41da1d-2fa0-4c70-8cf7-ae18a055b298",
+    "seed": 2105160243,
+    "train_steps": 3300,
+    "configuration_reference": "Track 3 result #12 Muon optimizer hyperparameters: all transformer matrix weights use lr=0.035, weight_decay=0.025; aux AdamW uses embed lr=0.3, proj lr=1/320, 1D lr=0.01, betas=(0.8,0.95), eps=1e-10, weight_decay=0. This runner intentionally keeps train_steps=3300 and dense tail validation.",
+    "validation": {
+      "early_frequency": 125,
+      "mid_frequency": 25,
+      "mid_start_step": 3000,
+      "late_frequency": 10,
+      "late_start_step": 3200,
+      "data": "../../../../data/fineweb10B/fineweb_val_*.bin",
+      "val_tokens": 10485760
+    },
+    "batch_size_tokens": 524288,
+    "microbatch_sequences": 64,
+    "optimizer": {
+      "name": "DistributedMuonLAllLayer",
+      "mode": "alllayer",
+      "rho": 1.0,
+      "interval": 5,
+      "ns_steps": 12,
+      "ns_coefficients": "newton_muon:a=2,b=-1.5,c=0.5",
+      "momentum": 0.95,
+      "nesterov": true,
+      "scale_ema_beta": 0.9,
+      "qkv_handling": "same_param_group_no_special_kind",
+      "shape_scaling": "sqrt(max(1, rows / cols))",
+      "alllayer_ratio_policy": "relative_scale=EMA((||W||_F/||U||_F)/mean_all_nonzero(||W||_F/||U||_F)); zero-weight matrices use relative_scale=1",
+      "groups": [
+        {
+          "name": "q/k/v",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 36,
+          "num_params": 21233664,
+          "matrix_kinds": {
+            "attn_k": 12,
+            "attn_q": 12,
+            "attn_v": 12
+          },
+          "zero_init_tensors": 0
+        },
+        {
+          "name": "attn.proj",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 7077888,
+          "matrix_kinds": {
+            "attn_proj": 12
+          },
+          "zero_init_tensors": 12
+        },
+        {
+          "name": "mlp.fc",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 28311552,
+          "matrix_kinds": {
+            "mlp_fc": 12
+          },
+          "zero_init_tensors": 0
+        },
+        {
+          "name": "mlp.proj",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 28311552,
+          "matrix_kinds": {
+            "mlp_proj": 12
+          },
+          "zero_init_tensors": 12
+        }
+      ]
+    },
+    "aux_adamw": {
+      "betas": [
+        0.8,
+        0.95
+      ],
+      "eps": 1e-10,
+      "weight_decay": 0,
+      "groups": [
+        {
+          "lr": 0.3,
+          "num_params": 38633472
+        },
+        {
+          "lr": 0.003125,
+          "num_params": 38633472
+        },
+        {
+          "lr": 0.01,
+          "num_params": 153216
+        }
+      ]
+    }
+  },
+  {
+    "logfile": "../../../../records/track_3_optimization/results/muonl_br_sharedlr_H100/3bc7667b-894b-41b8-aaf0-314e6ecc0b53.txt",
+    "trial_idx": 6,
+    "trial_id": "3bc7667b-894b-41b8-aaf0-314e6ecc0b53",
+    "seed": 1550199139,
+    "train_steps": 3300,
+    "configuration_reference": "Track 3 result #12 Muon optimizer hyperparameters: all transformer matrix weights use lr=0.035, weight_decay=0.025; aux AdamW uses embed lr=0.3, proj lr=1/320, 1D lr=0.01, betas=(0.8,0.95), eps=1e-10, weight_decay=0. This runner intentionally keeps train_steps=3300 and dense tail validation.",
+    "validation": {
+      "early_frequency": 125,
+      "mid_frequency": 25,
+      "mid_start_step": 3000,
+      "late_frequency": 10,
+      "late_start_step": 3200,
+      "data": "../../../../data/fineweb10B/fineweb_val_*.bin",
+      "val_tokens": 10485760
+    },
+    "batch_size_tokens": 524288,
+    "microbatch_sequences": 64,
+    "optimizer": {
+      "name": "DistributedMuonLAllLayer",
+      "mode": "alllayer",
+      "rho": 1.0,
+      "interval": 5,
+      "ns_steps": 12,
+      "ns_coefficients": "newton_muon:a=2,b=-1.5,c=0.5",
+      "momentum": 0.95,
+      "nesterov": true,
+      "scale_ema_beta": 0.9,
+      "qkv_handling": "same_param_group_no_special_kind",
+      "shape_scaling": "sqrt(max(1, rows / cols))",
+      "alllayer_ratio_policy": "relative_scale=EMA((||W||_F/||U||_F)/mean_all_nonzero(||W||_F/||U||_F)); zero-weight matrices use relative_scale=1",
+      "groups": [
+        {
+          "name": "q/k/v",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 36,
+          "num_params": 21233664,
+          "matrix_kinds": {
+            "attn_k": 12,
+            "attn_q": 12,
+            "attn_v": 12
+          },
+          "zero_init_tensors": 0
+        },
+        {
+          "name": "attn.proj",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 7077888,
+          "matrix_kinds": {
+            "attn_proj": 12
+          },
+          "zero_init_tensors": 12
+        },
+        {
+          "name": "mlp.fc",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 28311552,
+          "matrix_kinds": {
+            "mlp_fc": 12
+          },
+          "zero_init_tensors": 0
+        },
+        {
+          "name": "mlp.proj",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 28311552,
+          "matrix_kinds": {
+            "mlp_proj": 12
+          },
+          "zero_init_tensors": 12
+        }
+      ]
+    },
+    "aux_adamw": {
+      "betas": [
+        0.8,
+        0.95
+      ],
+      "eps": 1e-10,
+      "weight_decay": 0,
+      "groups": [
+        {
+          "lr": 0.3,
+          "num_params": 38633472
+        },
+        {
+          "lr": 0.003125,
+          "num_params": 38633472
+        },
+        {
+          "lr": 0.01,
+          "num_params": 153216
+        }
+      ]
+    }
+  },
+  {
+    "logfile": "../../../../records/track_3_optimization/results/muonl_br_sharedlr_H100/a47686b8-6add-4627-989e-65abba91b9e2.txt",
+    "trial_idx": 7,
+    "trial_id": "a47686b8-6add-4627-989e-65abba91b9e2",
+    "seed": 1916124399,
+    "train_steps": 3300,
+    "configuration_reference": "Track 3 result #12 Muon optimizer hyperparameters: all transformer matrix weights use lr=0.035, weight_decay=0.025; aux AdamW uses embed lr=0.3, proj lr=1/320, 1D lr=0.01, betas=(0.8,0.95), eps=1e-10, weight_decay=0. This runner intentionally keeps train_steps=3300 and dense tail validation.",
+    "validation": {
+      "early_frequency": 125,
+      "mid_frequency": 25,
+      "mid_start_step": 3000,
+      "late_frequency": 10,
+      "late_start_step": 3200,
+      "data": "../../../../data/fineweb10B/fineweb_val_*.bin",
+      "val_tokens": 10485760
+    },
+    "batch_size_tokens": 524288,
+    "microbatch_sequences": 64,
+    "optimizer": {
+      "name": "DistributedMuonLAllLayer",
+      "mode": "alllayer",
+      "rho": 1.0,
+      "interval": 5,
+      "ns_steps": 12,
+      "ns_coefficients": "newton_muon:a=2,b=-1.5,c=0.5",
+      "momentum": 0.95,
+      "nesterov": true,
+      "scale_ema_beta": 0.9,
+      "qkv_handling": "same_param_group_no_special_kind",
+      "shape_scaling": "sqrt(max(1, rows / cols))",
+      "alllayer_ratio_policy": "relative_scale=EMA((||W||_F/||U||_F)/mean_all_nonzero(||W||_F/||U||_F)); zero-weight matrices use relative_scale=1",
+      "groups": [
+        {
+          "name": "q/k/v",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 36,
+          "num_params": 21233664,
+          "matrix_kinds": {
+            "attn_k": 12,
+            "attn_q": 12,
+            "attn_v": 12
+          },
+          "zero_init_tensors": 0
+        },
+        {
+          "name": "attn.proj",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 7077888,
+          "matrix_kinds": {
+            "attn_proj": 12
+          },
+          "zero_init_tensors": 12
+        },
+        {
+          "name": "mlp.fc",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 28311552,
+          "matrix_kinds": {
+            "mlp_fc": 12
+          },
+          "zero_init_tensors": 0
+        },
+        {
+          "name": "mlp.proj",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 28311552,
+          "matrix_kinds": {
+            "mlp_proj": 12
+          },
+          "zero_init_tensors": 12
+        }
+      ]
+    },
+    "aux_adamw": {
+      "betas": [
+        0.8,
+        0.95
+      ],
+      "eps": 1e-10,
+      "weight_decay": 0,
+      "groups": [
+        {
+          "lr": 0.3,
+          "num_params": 38633472
+        },
+        {
+          "lr": 0.003125,
+          "num_params": 38633472
+        },
+        {
+          "lr": 0.01,
+          "num_params": 153216
+        }
+      ]
+    }
+  },
+  {
+    "logfile": "../../../../records/track_3_optimization/results/muonl_br_sharedlr_H100/4a503f34-488f-4620-bd86-abc69497c21b.txt",
+    "trial_idx": 8,
+    "trial_id": "4a503f34-488f-4620-bd86-abc69497c21b",
+    "seed": 2038028716,
+    "train_steps": 3300,
+    "configuration_reference": "Track 3 result #12 Muon optimizer hyperparameters: all transformer matrix weights use lr=0.035, weight_decay=0.025; aux AdamW uses embed lr=0.3, proj lr=1/320, 1D lr=0.01, betas=(0.8,0.95), eps=1e-10, weight_decay=0. This runner intentionally keeps train_steps=3300 and dense tail validation.",
+    "validation": {
+      "early_frequency": 125,
+      "mid_frequency": 25,
+      "mid_start_step": 3000,
+      "late_frequency": 10,
+      "late_start_step": 3200,
+      "data": "../../../../data/fineweb10B/fineweb_val_*.bin",
+      "val_tokens": 10485760
+    },
+    "batch_size_tokens": 524288,
+    "microbatch_sequences": 64,
+    "optimizer": {
+      "name": "DistributedMuonLAllLayer",
+      "mode": "alllayer",
+      "rho": 1.0,
+      "interval": 5,
+      "ns_steps": 12,
+      "ns_coefficients": "newton_muon:a=2,b=-1.5,c=0.5",
+      "momentum": 0.95,
+      "nesterov": true,
+      "scale_ema_beta": 0.9,
+      "qkv_handling": "same_param_group_no_special_kind",
+      "shape_scaling": "sqrt(max(1, rows / cols))",
+      "alllayer_ratio_policy": "relative_scale=EMA((||W||_F/||U||_F)/mean_all_nonzero(||W||_F/||U||_F)); zero-weight matrices use relative_scale=1",
+      "groups": [
+        {
+          "name": "q/k/v",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 36,
+          "num_params": 21233664,
+          "matrix_kinds": {
+            "attn_k": 12,
+            "attn_q": 12,
+            "attn_v": 12
+          },
+          "zero_init_tensors": 0
+        },
+        {
+          "name": "attn.proj",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 7077888,
+          "matrix_kinds": {
+            "attn_proj": 12
+          },
+          "zero_init_tensors": 12
+        },
+        {
+          "name": "mlp.fc",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 28311552,
+          "matrix_kinds": {
+            "mlp_fc": 12
+          },
+          "zero_init_tensors": 0
+        },
+        {
+          "name": "mlp.proj",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 28311552,
+          "matrix_kinds": {
+            "mlp_proj": 12
+          },
+          "zero_init_tensors": 12
+        }
+      ]
+    },
+    "aux_adamw": {
+      "betas": [
+        0.8,
+        0.95
+      ],
+      "eps": 1e-10,
+      "weight_decay": 0,
+      "groups": [
+        {
+          "lr": 0.3,
+          "num_params": 38633472
+        },
+        {
+          "lr": 0.003125,
+          "num_params": 38633472
+        },
+        {
+          "lr": 0.01,
+          "num_params": 153216
+        }
+      ]
+    }
+  },
+  {
+    "logfile": "../../../../records/track_3_optimization/results/muonl_br_sharedlr_H100/fc3e864e-f266-4bd6-82a1-b36c79d9cd68.txt",
+    "trial_idx": 9,
+    "trial_id": "fc3e864e-f266-4bd6-82a1-b36c79d9cd68",
+    "seed": 297046642,
+    "train_steps": 3300,
+    "configuration_reference": "Track 3 result #12 Muon optimizer hyperparameters: all transformer matrix weights use lr=0.035, weight_decay=0.025; aux AdamW uses embed lr=0.3, proj lr=1/320, 1D lr=0.01, betas=(0.8,0.95), eps=1e-10, weight_decay=0. This runner intentionally keeps train_steps=3300 and dense tail validation.",
+    "validation": {
+      "early_frequency": 125,
+      "mid_frequency": 25,
+      "mid_start_step": 3000,
+      "late_frequency": 10,
+      "late_start_step": 3200,
+      "data": "../../../../data/fineweb10B/fineweb_val_*.bin",
+      "val_tokens": 10485760
+    },
+    "batch_size_tokens": 524288,
+    "microbatch_sequences": 64,
+    "optimizer": {
+      "name": "DistributedMuonLAllLayer",
+      "mode": "alllayer",
+      "rho": 1.0,
+      "interval": 5,
+      "ns_steps": 12,
+      "ns_coefficients": "newton_muon:a=2,b=-1.5,c=0.5",
+      "momentum": 0.95,
+      "nesterov": true,
+      "scale_ema_beta": 0.9,
+      "qkv_handling": "same_param_group_no_special_kind",
+      "shape_scaling": "sqrt(max(1, rows / cols))",
+      "alllayer_ratio_policy": "relative_scale=EMA((||W||_F/||U||_F)/mean_all_nonzero(||W||_F/||U||_F)); zero-weight matrices use relative_scale=1",
+      "groups": [
+        {
+          "name": "q/k/v",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 36,
+          "num_params": 21233664,
+          "matrix_kinds": {
+            "attn_k": 12,
+            "attn_q": 12,
+            "attn_v": 12
+          },
+          "zero_init_tensors": 0
+        },
+        {
+          "name": "attn.proj",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 7077888,
+          "matrix_kinds": {
+            "attn_proj": 12
+          },
+          "zero_init_tensors": 12
+        },
+        {
+          "name": "mlp.fc",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 28311552,
+          "matrix_kinds": {
+            "mlp_fc": 12
+          },
+          "zero_init_tensors": 0
+        },
+        {
+          "name": "mlp.proj",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 28311552,
+          "matrix_kinds": {
+            "mlp_proj": 12
+          },
+          "zero_init_tensors": 12
+        }
+      ]
+    },
+    "aux_adamw": {
+      "betas": [
+        0.8,
+        0.95
+      ],
+      "eps": 1e-10,
+      "weight_decay": 0,
+      "groups": [
+        {
+          "lr": 0.3,
+          "num_params": 38633472
+        },
+        {
+          "lr": 0.003125,
+          "num_params": 38633472
+        },
+        {
+          "lr": 0.01,
+          "num_params": 153216
+        }
+      ]
+    }
+  },
+  {
+    "logfile": "../../../../records/track_3_optimization/results/muonl_br_sharedlr_H100/1533c276-d8a1-4b01-bc39-f587db4eed66.txt",
+    "trial_idx": 10,
+    "trial_id": "1533c276-d8a1-4b01-bc39-f587db4eed66",
+    "seed": 2038768841,
+    "train_steps": 3300,
+    "configuration_reference": "Track 3 result #12 Muon optimizer hyperparameters: all transformer matrix weights use lr=0.035, weight_decay=0.025; aux AdamW uses embed lr=0.3, proj lr=1/320, 1D lr=0.01, betas=(0.8,0.95), eps=1e-10, weight_decay=0. This runner intentionally keeps train_steps=3300 and dense tail validation.",
+    "validation": {
+      "early_frequency": 125,
+      "mid_frequency": 25,
+      "mid_start_step": 3000,
+      "late_frequency": 10,
+      "late_start_step": 3200,
+      "data": "../../../../data/fineweb10B/fineweb_val_*.bin",
+      "val_tokens": 10485760
+    },
+    "batch_size_tokens": 524288,
+    "microbatch_sequences": 64,
+    "optimizer": {
+      "name": "DistributedMuonLAllLayer",
+      "mode": "alllayer",
+      "rho": 1.0,
+      "interval": 5,
+      "ns_steps": 12,
+      "ns_coefficients": "newton_muon:a=2,b=-1.5,c=0.5",
+      "momentum": 0.95,
+      "nesterov": true,
+      "scale_ema_beta": 0.9,
+      "qkv_handling": "same_param_group_no_special_kind",
+      "shape_scaling": "sqrt(max(1, rows / cols))",
+      "alllayer_ratio_policy": "relative_scale=EMA((||W||_F/||U||_F)/mean_all_nonzero(||W||_F/||U||_F)); zero-weight matrices use relative_scale=1",
+      "groups": [
+        {
+          "name": "q/k/v",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 36,
+          "num_params": 21233664,
+          "matrix_kinds": {
+            "attn_k": 12,
+            "attn_q": 12,
+            "attn_v": 12
+          },
+          "zero_init_tensors": 0
+        },
+        {
+          "name": "attn.proj",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 7077888,
+          "matrix_kinds": {
+            "attn_proj": 12
+          },
+          "zero_init_tensors": 12
+        },
+        {
+          "name": "mlp.fc",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 28311552,
+          "matrix_kinds": {
+            "mlp_fc": 12
+          },
+          "zero_init_tensors": 0
+        },
+        {
+          "name": "mlp.proj",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 28311552,
+          "matrix_kinds": {
+            "mlp_proj": 12
+          },
+          "zero_init_tensors": 12
+        }
+      ]
+    },
+    "aux_adamw": {
+      "betas": [
+        0.8,
+        0.95
+      ],
+      "eps": 1e-10,
+      "weight_decay": 0,
+      "groups": [
+        {
+          "lr": 0.3,
+          "num_params": 38633472
+        },
+        {
+          "lr": 0.003125,
+          "num_params": 38633472
+        },
+        {
+          "lr": 0.01,
+          "num_params": 153216
+        }
+      ]
+    }
+  },
+  {
+    "logfile": "../../../../records/track_3_optimization/results/muonl_br_sharedlr_H100/5c6f653e-6b23-4a98-9638-7afb43a24764.txt",
+    "trial_idx": 11,
+    "trial_id": "5c6f653e-6b23-4a98-9638-7afb43a24764",
+    "seed": 786919891,
+    "train_steps": 3300,
+    "configuration_reference": "Track 3 result #12 Muon optimizer hyperparameters: all transformer matrix weights use lr=0.035, weight_decay=0.025; aux AdamW uses embed lr=0.3, proj lr=1/320, 1D lr=0.01, betas=(0.8,0.95), eps=1e-10, weight_decay=0. This runner intentionally keeps train_steps=3300 and dense tail validation.",
+    "validation": {
+      "early_frequency": 125,
+      "mid_frequency": 25,
+      "mid_start_step": 3000,
+      "late_frequency": 10,
+      "late_start_step": 3200,
+      "data": "../../../../data/fineweb10B/fineweb_val_*.bin",
+      "val_tokens": 10485760
+    },
+    "batch_size_tokens": 524288,
+    "microbatch_sequences": 64,
+    "optimizer": {
+      "name": "DistributedMuonLAllLayer",
+      "mode": "alllayer",
+      "rho": 1.0,
+      "interval": 5,
+      "ns_steps": 12,
+      "ns_coefficients": "newton_muon:a=2,b=-1.5,c=0.5",
+      "momentum": 0.95,
+      "nesterov": true,
+      "scale_ema_beta": 0.9,
+      "qkv_handling": "same_param_group_no_special_kind",
+      "shape_scaling": "sqrt(max(1, rows / cols))",
+      "alllayer_ratio_policy": "relative_scale=EMA((||W||_F/||U||_F)/mean_all_nonzero(||W||_F/||U||_F)); zero-weight matrices use relative_scale=1",
+      "groups": [
+        {
+          "name": "q/k/v",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 36,
+          "num_params": 21233664,
+          "matrix_kinds": {
+            "attn_k": 12,
+            "attn_q": 12,
+            "attn_v": 12
+          },
+          "zero_init_tensors": 0
+        },
+        {
+          "name": "attn.proj",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 7077888,
+          "matrix_kinds": {
+            "attn_proj": 12
+          },
+          "zero_init_tensors": 12
+        },
+        {
+          "name": "mlp.fc",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 28311552,
+          "matrix_kinds": {
+            "mlp_fc": 12
+          },
+          "zero_init_tensors": 0
+        },
+        {
+          "name": "mlp.proj",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 28311552,
+          "matrix_kinds": {
+            "mlp_proj": 12
+          },
+          "zero_init_tensors": 12
+        }
+      ]
+    },
+    "aux_adamw": {
+      "betas": [
+        0.8,
+        0.95
+      ],
+      "eps": 1e-10,
+      "weight_decay": 0,
+      "groups": [
+        {
+          "lr": 0.3,
+          "num_params": 38633472
+        },
+        {
+          "lr": 0.003125,
+          "num_params": 38633472
+        },
+        {
+          "lr": 0.01,
+          "num_params": 153216
+        }
+      ]
+    }
+  },
+  {
+    "logfile": "../../../../records/track_3_optimization/results/muonl_br_sharedlr_H100/279e254d-a0bd-4fac-b5f4-7111f9683941.txt",
+    "trial_idx": 12,
+    "trial_id": "279e254d-a0bd-4fac-b5f4-7111f9683941",
+    "seed": 446674771,
+    "train_steps": 3300,
+    "configuration_reference": "Track 3 result #12 Muon optimizer hyperparameters: all transformer matrix weights use lr=0.035, weight_decay=0.025; aux AdamW uses embed lr=0.3, proj lr=1/320, 1D lr=0.01, betas=(0.8,0.95), eps=1e-10, weight_decay=0. This runner intentionally keeps train_steps=3300 and dense tail validation.",
+    "validation": {
+      "early_frequency": 125,
+      "mid_frequency": 25,
+      "mid_start_step": 3000,
+      "late_frequency": 10,
+      "late_start_step": 3200,
+      "data": "../../../../data/fineweb10B/fineweb_val_*.bin",
+      "val_tokens": 10485760
+    },
+    "batch_size_tokens": 524288,
+    "microbatch_sequences": 64,
+    "optimizer": {
+      "name": "DistributedMuonLAllLayer",
+      "mode": "alllayer",
+      "rho": 1.0,
+      "interval": 5,
+      "ns_steps": 12,
+      "ns_coefficients": "newton_muon:a=2,b=-1.5,c=0.5",
+      "momentum": 0.95,
+      "nesterov": true,
+      "scale_ema_beta": 0.9,
+      "qkv_handling": "same_param_group_no_special_kind",
+      "shape_scaling": "sqrt(max(1, rows / cols))",
+      "alllayer_ratio_policy": "relative_scale=EMA((||W||_F/||U||_F)/mean_all_nonzero(||W||_F/||U||_F)); zero-weight matrices use relative_scale=1",
+      "groups": [
+        {
+          "name": "q/k/v",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 36,
+          "num_params": 21233664,
+          "matrix_kinds": {
+            "attn_k": 12,
+            "attn_q": 12,
+            "attn_v": 12
+          },
+          "zero_init_tensors": 0
+        },
+        {
+          "name": "attn.proj",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 7077888,
+          "matrix_kinds": {
+            "attn_proj": 12
+          },
+          "zero_init_tensors": 12
+        },
+        {
+          "name": "mlp.fc",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 28311552,
+          "matrix_kinds": {
+            "mlp_fc": 12
+          },
+          "zero_init_tensors": 0
+        },
+        {
+          "name": "mlp.proj",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 28311552,
+          "matrix_kinds": {
+            "mlp_proj": 12
+          },
+          "zero_init_tensors": 12
+        }
+      ]
+    },
+    "aux_adamw": {
+      "betas": [
+        0.8,
+        0.95
+      ],
+      "eps": 1e-10,
+      "weight_decay": 0,
+      "groups": [
+        {
+          "lr": 0.3,
+          "num_params": 38633472
+        },
+        {
+          "lr": 0.003125,
+          "num_params": 38633472
+        },
+        {
+          "lr": 0.01,
+          "num_params": 153216
+        }
+      ]
+    }
+  },
+  {
+    "logfile": "../../../../records/track_3_optimization/results/muonl_br_sharedlr_H100/3d036d77-b86f-4c47-9053-b0528f5fea6e.txt",
+    "trial_idx": 13,
+    "trial_id": "3d036d77-b86f-4c47-9053-b0528f5fea6e",
+    "seed": 1448096812,
+    "train_steps": 3300,
+    "configuration_reference": "Track 3 result #12 Muon optimizer hyperparameters: all transformer matrix weights use lr=0.035, weight_decay=0.025; aux AdamW uses embed lr=0.3, proj lr=1/320, 1D lr=0.01, betas=(0.8,0.95), eps=1e-10, weight_decay=0. This runner intentionally keeps train_steps=3300 and dense tail validation.",
+    "validation": {
+      "early_frequency": 125,
+      "mid_frequency": 25,
+      "mid_start_step": 3000,
+      "late_frequency": 10,
+      "late_start_step": 3200,
+      "data": "../../../../data/fineweb10B/fineweb_val_*.bin",
+      "val_tokens": 10485760
+    },
+    "batch_size_tokens": 524288,
+    "microbatch_sequences": 64,
+    "optimizer": {
+      "name": "DistributedMuonLAllLayer",
+      "mode": "alllayer",
+      "rho": 1.0,
+      "interval": 5,
+      "ns_steps": 12,
+      "ns_coefficients": "newton_muon:a=2,b=-1.5,c=0.5",
+      "momentum": 0.95,
+      "nesterov": true,
+      "scale_ema_beta": 0.9,
+      "qkv_handling": "same_param_group_no_special_kind",
+      "shape_scaling": "sqrt(max(1, rows / cols))",
+      "alllayer_ratio_policy": "relative_scale=EMA((||W||_F/||U||_F)/mean_all_nonzero(||W||_F/||U||_F)); zero-weight matrices use relative_scale=1",
+      "groups": [
+        {
+          "name": "q/k/v",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 36,
+          "num_params": 21233664,
+          "matrix_kinds": {
+            "attn_k": 12,
+            "attn_q": 12,
+            "attn_v": 12
+          },
+          "zero_init_tensors": 0
+        },
+        {
+          "name": "attn.proj",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 7077888,
+          "matrix_kinds": {
+            "attn_proj": 12
+          },
+          "zero_init_tensors": 12
+        },
+        {
+          "name": "mlp.fc",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 28311552,
+          "matrix_kinds": {
+            "mlp_fc": 12
+          },
+          "zero_init_tensors": 0
+        },
+        {
+          "name": "mlp.proj",
+          "lr": 0.035,
+          "weight_decay": 0.025,
+          "num_tensors": 12,
+          "num_params": 28311552,
+          "matrix_kinds": {
+            "mlp_proj": 12
+          },
+          "zero_init_tensors": 12
+        }
+      ]
+    },
+    "aux_adamw": {
+      "betas": [
+        0.8,
+        0.95
+      ],
+      "eps": 1e-10,
+      "weight_decay": 0,
+      "groups": [
+        {
+          "lr": 0.3,
+          "num_params": 38633472
+        },
+        {
+          "lr": 0.003125,
+          "num_params": 38633472
+        },
+        {
+          "lr": 0.01,
+          "num_params": 153216
+        }
+      ]
+    }
+  }
+]

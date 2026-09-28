@@ -1,0 +1,5 @@
+launch_time_utc=2026-07-27T11:16:53Z
+CUDA_VISIBLE_DEVICES=0
+GPU 0: NVIDIA H100 80GB HBM3
+index, name, driver_version, memory.total [MiB]
+0, NVIDIA H100 80GB HBM3, 580.159.03, 81559 MiB
