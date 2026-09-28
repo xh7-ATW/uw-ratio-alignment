@@ -1,4 +1,4 @@
-# u-w Ratio Alignment Experiments
+# U-W Ratio Alignment Experiments
 
 This directory contains the public-facing code and evidence map for the
 MuonL/t-MuonL u-w ratio alignment experiments. It is organized so that each

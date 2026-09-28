@@ -1,7 +1,6 @@
 <h1 align="center">Does U-W Ratio Alignment Benefit Muon in LLM Pretraining?</h1>
 
 <p align="center">
-  <a href="uw_ratio_alignment.pdf"><b>Paper (PDF)</b></a> &nbsp;·&nbsp;
   <a href="#running-the-code"><b>Running the code</b></a> &nbsp;·&nbsp;
   <a href="Reproducibility.md"><b>Reproduction guide</b></a>
 </p>
@@ -36,7 +35,7 @@ For a weight matrix $`W_i`$ with Muon update $`U_i`$ (before the learning rate),
 
 ## 2. Setup
 
-**Update model.** $`ℐ`$ indexes the matrices that Muon updates: 72 in the 12-layer model. For block $`i\inℐ`$:
+**Update model.** $`ℐ`$ indexes the weight matrices that Muon updates. The model has 12 Transformer layers with six such matrices each, so there are 72 in total. For block $`i\inℐ`$:
 
 - $`W_i`$ is the weight and $`w_i=\lVert W_i\rVert_F`$ its norm.
 - $`U_i`$ is the Muon update, $`\eta_i`$ its learning rate, and $`r_i`$ the original u-w ratio.
